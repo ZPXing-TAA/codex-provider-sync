@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-provider-sync"
+version = "0.2.1"
+description = "Synchronize Codex provider metadata and repair desktop history indexes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Xingzheng Peng" }
+]
+keywords = ["codex", "provider", "history", "sqlite", "macos"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "tomli>=2.0.1; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/ZPXing-TAA/codex-provider-sync"
+Issues = "https://github.com/ZPXing-TAA/codex-provider-sync/issues"
+
+[project.scripts]
+codex-switch = "codex_provider_sync.cli:main_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]

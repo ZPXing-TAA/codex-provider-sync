@@ -1,0 +1,10 @@
+#!/bin/sh
+
+PYTHON="$HOME/.local/share/codex-provider-sync/venv/bin/python"
+
+if [ ! -x "$PYTHON" ]; then
+  echo "codex-switch: installation not found; run ./install.sh again" >&2
+  exit 1
+fi
+
+exec "$PYTHON" -m codex_provider_sync "$@"
