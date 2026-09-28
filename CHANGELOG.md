@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-09-28
+
+- Add a provider-aware Responses API history normalizer.
+- Keep provenance separate from request items.
+- Strip cross-provider IDs, drop opaque continuation state, and remove tool pairs together.
+- Validate same-provider reasoning namespaces and tool relationships before serialization.
+- Add regression coverage for legacy contaminated sessions and repeated provider switches.
+
 ## 0.2.1 - 2026-08-16
 
 - Package the tool as `codex-provider-sync` with a `codex-switch` CLI.

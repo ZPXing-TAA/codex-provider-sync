@@ -41,6 +41,40 @@ After a provider change, these layers can disagree about `model_provider`. On af
 
 It does **not** configure provider credentials, decrypt provider-bound history, or merge separate forked threads into one conversation.
 
+## Responses API history normalization
+
+The metadata repair performed by `codex-switch` is separate from request
+serialization. The reusable `codex_provider_sync.history` module is the
+normalization boundary for code that turns persisted response items into a
+provider request:
+
+```python
+from codex_provider_sync.history import normalize_response_history
+
+normalized = normalize_response_history(
+    persisted_items,
+    source_provider=session_source_provider,
+    target_provider=active_provider,
+    source_endpoint=session_source_endpoint,
+    source_model=session_source_model,
+)
+request_input = normalized.items
+```
+
+The normalizer keeps provenance out of the API payload. When providers differ,
+it preserves ordinary message content, removes provider-generated IDs, drops
+opaque reasoning/compaction state (retaining a visible summary when one is
+available), and removes tool-call state as a complete unit. It never rewrites
+an ID prefix such as `item_` to `rs_`. When the provider is unchanged, it
+preserves native state but validates OpenAI reasoning namespaces and tool-call
+relationships before serialization. Sessions without provenance are treated
+as cross-provider for safety.
+
+This repository does not contain Codex Desktop's private request serializer,
+so the normalizer must be called by the host immediately before it builds the
+Responses API `input` array. `codex-switch sync` alone repairs local metadata;
+it cannot intercept a separately implemented request path.
+
 ## Requirements
 
 - macOS
@@ -244,7 +278,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-The test suite uses isolated temporary Codex homes and covers provider validation, TOML root-key handling, encrypted-history confirmation, database reconciliation, idempotency, automatic rollback, App reopening, and explicit restore.
+The test suite uses isolated temporary Codex homes and covers provider validation, TOML root-key handling, encrypted-history confirmation, database reconciliation, idempotency, automatic rollback, App reopening, explicit restore, and provider-aware Responses API history normalization.
 
 ## Project status
 

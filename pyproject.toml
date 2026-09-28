@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-provider-sync"
-version = "0.2.1"
+version = "0.3.0"
 description = "Synchronize Codex provider metadata and repair desktop history indexes."
 readme = "README.md"
 requires-python = ">=3.10"

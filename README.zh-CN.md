@@ -41,6 +41,27 @@ Codex 的本地聊天历史分布在几层状态中：
 
 它**不会**配置 provider 凭据、解密与 provider 绑定的历史，也不会把多个分叉任务合并成一条对话。
 
+## Responses API 历史规范化
+
+`codex-switch` 做的是本地元数据修复，与请求序列化是两个边界。对于将持久化 response item 转成 provider 请求的代码，可以在构造请求前调用可复用的 `codex_provider_sync.history` 模块：
+
+```python
+from codex_provider_sync.history import normalize_response_history
+
+normalized = normalize_response_history(
+    persisted_items,
+    source_provider=session_source_provider,
+    target_provider=active_provider,
+    source_endpoint=session_source_endpoint,
+    source_model=session_source_model,
+)
+request_input = normalized.items
+```
+
+规范化器会把 provenance 与 API payload 分开保存。跨 provider 时保留普通消息内容，删除 provider 生成的 ID，丢弃不透明的 reasoning/compaction 状态（如果有可见 summary，则保留为普通文本），并成对删除 tool-call 状态。它不会把 `item_` 之类的 ID 前缀直接改成 `rs_`。同一 provider 时保留原生状态，但会在序列化前校验 OpenAI reasoning 命名空间和 tool-call 关系。缺少 provenance 的旧会话会按跨 provider 保守处理。
+
+当前仓库不包含 Codex Desktop 私有的请求序列化器，因此规范化器需要由实际请求宿主在构造 Responses API `input` 数组前调用。单独运行 `codex-switch sync` 只能修复本地元数据，不能拦截另一条请求路径。
+
 ## 环境要求
 
 - macOS
@@ -244,7 +265,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、加密历史确认、双库冲突合并、幂等、自动回滚、App 重开和显式恢复。
+测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、加密历史确认、双库冲突合并、幂等、自动回滚、App 重开、显式恢复，以及 Responses API 历史的 provider-aware 规范化。
 
 ## 项目状态
 
