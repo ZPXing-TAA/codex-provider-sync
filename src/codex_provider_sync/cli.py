@@ -465,24 +465,16 @@ def update_rollout(path: Path, provider: str) -> RolloutUpdate:
     return RolloutUpdate(True, removed_items, converted_items, stripped_ids)
 
 
-def confirm_history_normalization(changes: list[RolloutInfo], assume_yes: bool) -> bool:
+def report_history_normalization(changes: list[RolloutInfo]) -> None:
     risky = [item for item in changes if item.response_items]
     if not risky:
-        return assume_yes
-    if assume_yes:
-        return True
+        return
     message = (
         f"{len(risky)} rollout file(s) contain provider-native response items from a different "
         "provider. The switch will keep portable messages, strip provider-generated IDs, and "
         "remove opaque reasoning and tool continuation state after creating a rollback backup."
     )
-    print(f"WARNING: {message}", file=sys.stderr)
-    if not sys.stdin.isatty():
-        raise RuntimeError("confirmation required; review the normalization warning and rerun with --yes")
-    answer = input("Continue after creating a rollback backup? [y/N] ").strip().lower()
-    if answer not in {"y", "yes"}:
-        raise RuntimeError("cancelled by user")
-    return True
+    print(f"Provider-state normalization: {message}", file=sys.stderr)
 
 
 def source_recency_expression(alias: str, columns: set[str]) -> str:
@@ -761,9 +753,7 @@ def run_sync(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"refusing to continue because {len(initial_scan.unreadable)} rollout file(s) are unreadable: {preview}"
         )
-    risk_accepted = confirm_history_normalization(
-        changed_rollouts(initial_scan, target_provider), args.yes
-    )
+    report_history_normalization(changed_rollouts(initial_scan, target_provider))
     if args.no_quit and codex_home == Path("~/.codex").expanduser().resolve() and is_codex_running():
         raise RuntimeError("refusing to modify the live default CODEX_HOME with --no-quit")
 
@@ -780,7 +770,6 @@ def run_sync(args: argparse.Namespace) -> None:
         if scan.unreadable:
             raise RuntimeError(f"{len(scan.unreadable)} rollout file(s) became unreadable")
         changes = changed_rollouts(scan, target_provider)
-        confirm_history_normalization(changes, risk_accepted)
         source_provider_counts = Counter(item.provider for item in changes)
         backup = create_backup(
             codex_home,
@@ -930,12 +919,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("backups", help="list rollback backups")
     sync = subparsers.add_parser("sync", help="sync history to the provider already active in config.toml")
     sync.add_argument("provider", nargs="?", help=argparse.SUPPRESS)
-    sync.add_argument("--yes", action="store_true", help="accept provider-state normalization")
+    sync.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     sync.add_argument("--keep", type=int, default=5, help="number of rollback backups to retain")
     add_lifecycle_options(sync)
     switch = subparsers.add_parser("switch", help="switch to a provider configured in config.toml and sync history")
     switch.add_argument("provider")
-    switch.add_argument("--yes", action="store_true", help="accept provider-state normalization")
+    switch.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     switch.add_argument("--keep", type=int, default=5, help="number of rollback backups to retain")
     add_lifecycle_options(switch)
     restore = subparsers.add_parser("restore", help="restore a rollback backup (latest by default)")

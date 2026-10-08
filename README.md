@@ -122,22 +122,24 @@ First, inspect the current state:
 codex-switch status
 ```
 
-If `config.toml` already selects the provider you want, synchronize history to it:
+After selecting a provider in Codex or CC Switch, run one command:
 
 ```bash
 codex-switch sync
 ```
 
+`sync` reads the active root `model_provider` from `~/.codex/config.toml`, treats it as the target, and automatically migrates only rollout/database records that still point elsewhere. You do not need to provide the old provider, the new provider, or a confirmation flag.
+
 The command will:
 
-1. warn before normalizing histories that contain provider-native response items;
+1. detect the target provider and report how many histories need normalization;
 2. quit Codex;
 3. create a rollback backup;
 4. reconcile rollout metadata, databases, and the sidebar catalog;
 5. validate the resulting databases;
 6. reopen Codex.
 
-For a provider already declared under `[model_providers.<id>]`, you can update the root `model_provider` and synchronize in one operation:
+If you are not using CC Switch, the optional `switch` command can select a provider already declared under `[model_providers.<id>]` and synchronize in one operation:
 
 ```bash
 codex-switch switch custom
@@ -158,7 +160,6 @@ codex-switch switch custom
 
 Useful options:
 
-- `--yes`: accept provider-state normalization non-interactively.
 - `--keep N`: retain the newest `N` rollback backups. The default is 5.
 - `--no-open`: do not reopen Codex after the operation.
 - `--codex-home PATH`: inspect or operate on another Codex home. Place this global option before the command.
@@ -242,7 +243,7 @@ For each rollout that actually changes provider, version 0.3.1:
 - removes opaque reasoning, compaction, unknown provider state, and tool-call pairs;
 - records the untouched original in the rollback backup first.
 
-This trades provider-native continuation efficiency and historical tool traces for portable conversational context. `--yes` accepts that normalization; it never makes opaque state portable.
+This trades provider-native continuation efficiency and historical tool traces for portable conversational context. The untouched original is always written to the rollback backup before normalization.
 
 ## Files modified
 
@@ -269,9 +270,9 @@ Re-run `./install.sh`. The installer uses a shell launcher and keeps the Python 
 
 Define the provider in `~/.codex/config.toml` first. The tool intentionally does not invent provider settings or credentials.
 
-### `confirmation required`
+### Which direction will `sync` use?
 
-The command detected provider-mismatched rollout files containing provider-native response items while running non-interactively. Review the normalization rules above, then rerun with `--yes`.
+It always follows the root `model_provider` currently selected in `~/.codex/config.toml`. Select the destination in Codex or CC Switch first, then run `codex-switch sync`. The rollout metadata is used only to identify which histories still need migration, never to guess a destination by majority.
 
 ### Codex did not reopen
 
@@ -291,7 +292,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-The test suite uses isolated temporary Codex homes and covers provider validation, TOML root-key handling, provider-state confirmation and migration, database reconciliation, idempotency, automatic rollback, App reopening, explicit restore, and provider-aware Responses API history normalization.
+The test suite uses isolated temporary Codex homes and covers provider validation, TOML root-key handling, automatic provider-state migration, database reconciliation, idempotency, automatic rollback, App reopening, explicit restore, and provider-aware Responses API history normalization.
 
 ## Project status
 

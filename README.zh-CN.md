@@ -109,22 +109,24 @@ codex-switch status
 codex-switch status
 ```
 
-如果 `config.toml` 已经选中了目标 provider，执行：
+在 Codex 或 CC Switch 中选好目标 provider 后，只需要执行一个命令：
 
 ```bash
 codex-switch sync
 ```
 
+`sync` 会读取 `~/.codex/config.toml` 根级别当前选中的 `model_provider`，将它作为目标，并只迁移仍指向其他 provider 的 rollout 和数据库记录。无需再填写来源、目标或确认参数。
+
 命令会依次：
 
-1. 对包含 provider 原生 response item 的跨 provider 历史发出规范化提示；
+1. 自动识别目标 provider，并报告需要规范化的历史数量；
 2. 退出 Codex；
 3. 创建回滚备份；
 4. 同步 rollout、两套数据库和侧栏目录；
 5. 校验结果数据库；
 6. 重新打开 Codex。
 
-如果 provider 已在 `[model_providers.<id>]` 中声明，也可以切换根配置并同步：
+如果不使用 CC Switch，也可以用可选的 `switch` 子命令选择已在 `[model_providers.<id>]` 中声明的 provider，并同步：
 
 ```bash
 codex-switch switch custom
@@ -145,7 +147,6 @@ codex-switch switch custom
 
 常用选项：
 
-- `--yes`：在非交互环境中接受 provider 原生状态规范化。
 - `--keep N`：保留最新 `N` 份备份，默认 5。
 - `--no-open`：操作结束后不重新打开 Codex。
 - `--codex-home PATH`：操作另一个 Codex home；这是全局选项，应写在子命令前面。
@@ -229,7 +230,7 @@ response ID、加密 reasoning、compaction 状态和 tool-call continuation 状
 - 删除不透明 reasoning、compaction、未知 provider 状态和 tool-call 对；
 - 修改前先把原始内容完整放进回滚备份。
 
-这会牺牲原 provider 的 continuation 效率和历史工具调用轨迹，但保留可移植的对话语义。`--yes` 表示接受这次规范化，并不会让不透明状态变得可移植。
+这会牺牲原 provider 的 continuation 效率和历史工具调用轨迹，但保留可移植的对话语义。规范化前始终会把未经修改的原始内容写入回滚备份。
 
 ## 会修改哪些文件
 
@@ -256,9 +257,9 @@ response ID、加密 reasoning、compaction 状态和 tool-call continuation 状
 
 先在 `~/.codex/config.toml` 中定义 provider。工具不会自动创建 provider 配置或凭据。
 
-### `confirmation required`
+### `sync` 会往哪边同步？
 
-非交互运行时检测到了包含 provider 原生 response item、且 provider 不匹配的 rollout。阅读上面的规范化规则后，再使用 `--yes`。
+它始终以 `~/.codex/config.toml` 根级别当前选中的 `model_provider` 为目标。先在 Codex 或 CC Switch 中选择目的地，再运行 `codex-switch sync`。rollout 中的 provider 只用于判断哪些历史需要迁移，不会按数量猜测目标方向。
 
 ### Codex 没有重新打开
 
@@ -278,7 +279,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、provider 原生状态确认与迁移、双库冲突合并、幂等、自动回滚、App 重开、显式恢复，以及 Responses API 历史的 provider-aware 规范化。
+测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、provider 原生状态自动迁移、双库冲突合并、幂等、自动回滚、App 重开、显式恢复，以及 Responses API 历史的 provider-aware 规范化。
 
 ## 项目状态
 

@@ -66,7 +66,7 @@ class CodexSwitchTest(unittest.TestCase):
         self.insert_thread(self.home / "sqlite/state_5.sqlite", "t2", "custom", title="second", updated=4)
         self.create_catalog(self.home / "sqlite/codex-dev.db")
 
-        result = self.run_cli("switch", "openai", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("switch", "openai", "--no-quit", "--no-open")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         config = (self.home / "config.toml").read_text()
@@ -87,7 +87,7 @@ class CodexSwitchTest(unittest.TestCase):
         rollout = self.write_rollout("custom")
         before = rollout.read_bytes()
 
-        result = self.run_cli("sync", "openai", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("sync", "openai", "--no-quit", "--no-open")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sync cannot target", result.stderr)
@@ -98,7 +98,7 @@ class CodexSwitchTest(unittest.TestCase):
         self.write_config("openai", include_custom=False)
         self.write_rollout("openai")
 
-        result = self.run_cli("switch", "custom", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("switch", "custom", "--no-quit", "--no-open")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not configured", result.stderr)
@@ -108,7 +108,7 @@ class CodexSwitchTest(unittest.TestCase):
         self.write_config("custom", include_custom=False)
         self.write_rollout("custom")
 
-        result = self.run_cli("sync", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("sync", "--no-quit", "--no-open")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("that provider is not configured", result.stderr)
@@ -130,7 +130,7 @@ class CodexSwitchTest(unittest.TestCase):
         (self.home / "config.toml").write_text('model = "keep-me"')
         self.write_rollout("openai")
 
-        result = self.run_cli("switch", "openai", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("switch", "openai", "--no-quit", "--no-open")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         status = self.run_cli("status", "--json")
@@ -138,16 +138,19 @@ class CodexSwitchTest(unittest.TestCase):
         self.assertEqual(json.loads(status.stdout)["config_provider"], "openai")
         self.assertIn('model = "keep-me"\nmodel_provider = "openai"', (self.home / "config.toml").read_text())
 
-    def test_encrypted_rollout_requires_explicit_confirmation(self):
-        self.write_config("custom")
+    def test_sync_auto_normalizes_provider_state_without_confirmation(self):
+        self.write_config("openai")
         rollout = self.write_rollout("custom", encrypted=True)
-        before = rollout.read_bytes()
 
-        result = self.run_cli("switch", "openai", "--no-quit", "--no-open")
+        result = self.run_cli("sync", "--no-quit", "--no-open")
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("confirmation required", result.stderr)
-        self.assertEqual(rollout.read_bytes(), before)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Provider-state normalization", result.stderr)
+        self.assertNotIn("encrypted_content", rollout.read_text())
+        self.assertEqual(
+            json.loads(rollout.read_text().splitlines()[0])["payload"]["model_provider"],
+            "openai",
+        )
 
     def test_switch_sanitizes_provider_native_response_state(self):
         self.write_config("custom")
@@ -183,7 +186,7 @@ class CodexSwitchTest(unittest.TestCase):
             ),
         )
 
-        result = self.run_cli("switch", "openai", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("switch", "openai", "--no-quit", "--no-open")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         response_items = [
@@ -203,7 +206,7 @@ class CodexSwitchTest(unittest.TestCase):
         self.write_config("openai")
         self.write_rollout("custom")
 
-        result = self.run_cli("sync", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("sync", "--no-quit", "--no-open")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         backup_line = next(line for line in result.stdout.splitlines() if line.startswith("Backup: "))
@@ -223,7 +226,7 @@ class CodexSwitchTest(unittest.TestCase):
         config_before = (self.home / "config.toml").read_bytes()
         rollout_before = rollout.read_bytes()
 
-        result = self.run_cli("switch", "openai", "--yes", "--no-quit", "--no-open")
+        result = self.run_cli("switch", "openai", "--no-quit", "--no-open")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rolled back", result.stderr)
@@ -242,7 +245,7 @@ class CodexSwitchTest(unittest.TestCase):
             db.execute("CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT)")
         args = argparse.Namespace(
             codex_home=str(self.home), command="switch", provider="openai",
-            yes=True, no_quit=False, no_open=False, keep=5,
+            no_quit=False, no_open=False, keep=5,
         )
 
         with patch.object(MODULE, "quit_codex") as quit_mock, patch.object(MODULE, "open_codex") as open_mock:
@@ -258,7 +261,7 @@ class CodexSwitchTest(unittest.TestCase):
         self.create_state(self.home / "state_5.sqlite", "t1", "custom")
         self.create_state(self.home / "sqlite/state_5.sqlite", "t1", "custom")
         self.create_catalog(self.home / "sqlite/codex-dev.db")
-        switched = self.run_cli("switch", "openai", "--yes", "--no-quit", "--no-open")
+        switched = self.run_cli("switch", "openai", "--no-quit", "--no-open")
         self.assertEqual(switched.returncode, 0, switched.stderr)
         backup_line = next(line for line in switched.stdout.splitlines() if line.startswith("Backup: "))
         backup = backup_line.removeprefix("Backup: ")
@@ -278,8 +281,8 @@ class CodexSwitchTest(unittest.TestCase):
         self.create_state(self.home / "state_5.sqlite", "t1", "openai")
         self.create_catalog(self.home / "sqlite/codex-dev.db")
 
-        first = self.run_cli("sync", "--yes", "--no-quit", "--no-open")
-        second = self.run_cli("sync", "--yes", "--no-quit", "--no-open")
+        first = self.run_cli("sync", "--no-quit", "--no-open")
+        second = self.run_cli("sync", "--no-quit", "--no-open")
 
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)

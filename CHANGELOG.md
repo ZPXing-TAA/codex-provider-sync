@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2 - 2026-10-08
+
+- Make `codex-switch sync` automatically detect the target from the active `config.toml` provider and proceed without a confirmation prompt.
+- Keep `--yes` as a hidden no-op for compatibility with existing scripts.
+
 ## 0.3.1 - 2026-10-08
 
 - Run provider-aware response-item normalization during rollout migration instead of only changing `session_meta.model_provider`.
