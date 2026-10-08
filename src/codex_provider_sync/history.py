@@ -57,10 +57,42 @@ class ProviderProvenance:
     source_provider: str | None
     source_endpoint: str | None = None
     source_model: str | None = None
+    source_auth_mode: str | None = None
+    source_transport: str | None = None
+    source_continuation_scope: str | None = None
 
-    def is_cross_provider(self, target_provider: str) -> bool:
-        # Missing provenance is treated conservatively as cross-provider.
-        return not self.source_provider or self.source_provider != target_provider
+    def is_compatible_with(
+        self,
+        *,
+        target_provider: str,
+        target_endpoint: str | None = None,
+        target_model: str | None = None,
+        target_auth_mode: str | None = None,
+        target_transport: str | None = None,
+        target_continuation_scope: str | None = None,
+        continuation_compatible: bool = False,
+    ) -> bool:
+        """Return whether provider-native continuation state may be replayed.
+
+        Provider names and item-ID prefixes are not proof of compatibility.
+        The request host must explicitly assert that the old continuation state
+        is valid in the current authenticated continuation domain.
+        """
+
+        if not continuation_compatible or self.source_provider != target_provider:
+            return False
+        pairs = (
+            (self.source_endpoint, target_endpoint),
+            (self.source_model, target_model),
+            (self.source_auth_mode, target_auth_mode),
+            (self.source_transport, target_transport),
+            (self.source_continuation_scope, target_continuation_scope),
+        )
+        return all(
+            source == target
+            for source, target in pairs
+            if source is not None or target is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -109,21 +141,46 @@ def normalize_response_history(
     target_provider: str,
     source_endpoint: str | None = None,
     source_model: str | None = None,
+    source_auth_mode: str | None = None,
+    source_transport: str | None = None,
+    source_continuation_scope: str | None = None,
+    target_endpoint: str | None = None,
+    target_model: str | None = None,
+    target_auth_mode: str | None = None,
+    target_transport: str | None = None,
+    target_continuation_scope: str | None = None,
+    continuation_compatible: bool = False,
     logger: DiagnosticLogger | None = None,
 ) -> NormalizationResult:
     """Return request-safe history for ``target_provider``.
 
-    Cross-provider normalization preserves semantic message content but drops
-    provider-native continuation state. Same-provider history is preserved and
-    tool relationships are validated instead of silently repaired.
+    Incompatible-continuation normalization preserves semantic message content
+    but drops provider-native continuation state. Native state is preserved
+    only when the caller explicitly asserts continuation compatibility; it is
+    then validated instead of silently repaired.
     """
 
-    provenance = ProviderProvenance(source_provider, source_endpoint, source_model)
-    cross_provider = provenance.is_cross_provider(target_provider)
+    provenance = ProviderProvenance(
+        source_provider,
+        source_endpoint,
+        source_model,
+        source_auth_mode,
+        source_transport,
+        source_continuation_scope,
+    )
+    native_state_compatible = provenance.is_compatible_with(
+        target_provider=target_provider,
+        target_endpoint=target_endpoint,
+        target_model=target_model,
+        target_auth_mode=target_auth_mode,
+        target_transport=target_transport,
+        target_continuation_scope=target_continuation_scope,
+        continuation_compatible=continuation_compatible,
+    )
     items = [copy.deepcopy(dict(item)) for item in history]
     diagnostics: list[HistoryDiagnostic] = []
 
-    if cross_provider:
+    if not native_state_compatible:
         result = _normalize_cross_provider(items, diagnostics)
     else:
         _validate_same_provider(items, target_provider)
@@ -139,6 +196,12 @@ def normalize_persisted_history(
     persisted: PersistedResponseHistory,
     *,
     target_provider: str,
+    target_endpoint: str | None = None,
+    target_model: str | None = None,
+    target_auth_mode: str | None = None,
+    target_transport: str | None = None,
+    target_continuation_scope: str | None = None,
+    continuation_compatible: bool = False,
     logger: DiagnosticLogger | None = None,
 ) -> NormalizationResult:
     """Normalize a persisted history while keeping provenance out of payload."""
@@ -150,6 +213,15 @@ def normalize_persisted_history(
         target_provider=target_provider,
         source_endpoint=provenance.source_endpoint,
         source_model=provenance.source_model,
+        source_auth_mode=provenance.source_auth_mode,
+        source_transport=provenance.source_transport,
+        source_continuation_scope=provenance.source_continuation_scope,
+        target_endpoint=target_endpoint,
+        target_model=target_model,
+        target_auth_mode=target_auth_mode,
+        target_transport=target_transport,
+        target_continuation_scope=target_continuation_scope,
+        continuation_compatible=continuation_compatible,
         logger=logger,
     )
 

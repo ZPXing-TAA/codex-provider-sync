@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 - 2026-10-08
+
+- Run provider-aware response-item normalization during rollout migration instead of only changing `session_meta.model_provider`.
+- Preserve portable messages and visible reasoning summaries while removing opaque reasoning, tool continuation state, and provider-generated IDs.
+- Require an explicit continuation-compatibility assertion before preserving native state, even when provider names match.
+- Record the rollout files' actual source-provider counts in backup manifests.
+- Report provider-bound rollout and response-item counts in `status` output.
+
 ## 0.3.0 - 2026-09-28
 
 - Add a provider-aware Responses API history normalizer.

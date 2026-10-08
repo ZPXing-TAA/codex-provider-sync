@@ -43,20 +43,24 @@ class CodexSwitchTest(unittest.TestCase):
         text += extra
         (self.home / "config.toml").write_text(text)
 
-    def write_rollout(self, provider="custom", encrypted=False):
+    def write_rollout(self, provider="custom", encrypted=False, response_items=()):
         rollout = self.home / "sessions/2026/01/01/rollout.jsonl"
         lines = [
             {"type": "session_meta", "payload": {"id": "t1", "model_provider": provider}},
             {"type": "event_msg", "payload": {"message": "kept"}},
         ]
         if encrypted:
-            lines.append({"type": "response_item", "payload": {"encrypted_content": "opaque"}})
+            lines.append({
+                "type": "response_item",
+                "payload": {"type": "reasoning", "id": "item_old", "encrypted_content": "opaque"},
+            })
+        lines.extend({"type": "response_item", "payload": item} for item in response_items)
         rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
         return rollout
 
     def test_switch_merges_reconciles_and_rebuilds_catalog(self):
         self.write_config()
-        rollout = self.write_rollout(encrypted=True)
+        rollout = self.write_rollout()
         self.create_state(self.home / "state_5.sqlite", "t1", "custom", title="older", updated=2)
         self.create_state(self.home / "sqlite/state_5.sqlite", "t1", "custom", title="newer", updated=3)
         self.insert_thread(self.home / "sqlite/state_5.sqlite", "t2", "custom", title="second", updated=4)
@@ -144,6 +148,70 @@ class CodexSwitchTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("confirmation required", result.stderr)
         self.assertEqual(rollout.read_bytes(), before)
+
+    def test_switch_sanitizes_provider_native_response_state(self):
+        self.write_config("custom")
+        rollout = self.write_rollout(
+            "custom",
+            response_items=(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "id": "msg_custom_user",
+                    "content": [{"type": "input_text", "text": "question"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_looks_valid_but_custom",
+                    "encrypted_content": "opaque",
+                    "summary": [{"text": "portable summary"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_custom",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_custom_assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+            ),
+        )
+
+        result = self.run_cli("switch", "openai", "--yes", "--no-quit", "--no-open")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response_items = [
+            record["payload"]
+            for record in map(json.loads, rollout.read_text().splitlines())
+            if record["type"] == "response_item"
+        ]
+        self.assertEqual([item["type"] for item in response_items], ["message", "message", "message"])
+        self.assertEqual(response_items[1]["content"][0]["text"], "portable summary")
+        self.assertTrue(all("id" not in item for item in response_items))
+        self.assertNotIn("opaque", rollout.read_text())
+        self.assertIn("Provider-native response items removed: 2", result.stdout)
+        self.assertIn("Reasoning summaries converted to messages: 1", result.stdout)
+        self.assertIn("Provider-generated IDs stripped: 2", result.stdout)
+
+    def test_backup_records_rollout_source_not_already_changed_config(self):
+        self.write_config("openai")
+        self.write_rollout("custom")
+
+        result = self.run_cli("sync", "--yes", "--no-quit", "--no-open")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backup_line = next(line for line in result.stdout.splitlines() if line.startswith("Backup: "))
+        manifest = json.loads(
+            (Path(backup_line.removeprefix("Backup: ")) / "manifest.json").read_text()
+        )
+        self.assertEqual(manifest["source_provider"], "custom")
+        self.assertEqual(manifest["source_provider_counts"], {"custom": 1})
 
     def test_failure_after_mutation_rolls_everything_back(self):
         self.write_config("custom")

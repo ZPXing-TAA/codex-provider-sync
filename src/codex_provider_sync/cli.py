@@ -16,9 +16,10 @@ import sqlite3
 import subprocess
 import sys
 import time
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from . import __version__
+from .history import normalize_response_history
 
 try:
     import tomllib
@@ -50,12 +51,21 @@ class RolloutInfo:
     path: Path
     provider: str
     encrypted: bool
+    response_items: int
 
 
 @dataclass(frozen=True)
 class RolloutScan:
     items: tuple[RolloutInfo, ...]
     unreadable: tuple[tuple[Path, str], ...]
+
+
+@dataclass(frozen=True)
+class RolloutUpdate:
+    changed: bool
+    removed_items: int = 0
+    converted_items: int = 0
+    stripped_ids: int = 0
 
 
 def quote_identifier(value: str) -> str:
@@ -239,6 +249,7 @@ def create_backup(
     operation: str,
     source_provider: str,
     target_provider: str,
+    source_provider_counts: Mapping[str, int] | None = None,
 ) -> Path:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = backup_root(codex_home) / f"{stamp}{BACKUP_SUFFIX}"
@@ -268,11 +279,15 @@ def create_backup(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
             manifest_rollouts.append(str(relative))
+        counts = dict(source_provider_counts or {})
+        if counts:
+            source_provider = next(iter(counts)) if len(counts) == 1 else "(mixed)"
         manifest = {
-            "version": 2,
+            "version": 3,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "operation": operation,
             "source_provider": source_provider,
+            "source_provider_counts": counts,
             "target_provider": target_provider,
             "databases": backed_up_databases,
             "absent_databases": absent_databases,
@@ -356,18 +371,6 @@ def rollout_paths(codex_home: Path) -> list[Path]:
     return sorted(paths)
 
 
-def file_contains(path: Path, token: bytes) -> bool:
-    overlap = max(0, len(token) - 1)
-    previous = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            combined = previous + chunk
-            if token in combined:
-                return True
-            previous = combined[-overlap:] if overlap else b""
-    return False
-
-
 def scan_rollouts(codex_home: Path) -> RolloutScan:
     items: list[RolloutInfo] = []
     unreadable: list[tuple[Path, str]] = []
@@ -375,13 +378,26 @@ def scan_rollouts(codex_home: Path) -> RolloutScan:
         try:
             with path.open("rb") as handle:
                 first = handle.readline()
+                encrypted = ENCRYPTED_TOKEN in first
+                response_items = 0
+                for line_number, line in enumerate(handle, 2):
+                    encrypted = encrypted or ENCRYPTED_TOKEN in line
+                    if b"response_item" not in line:
+                        continue
+                    record = json.loads(line)
+                    if record.get("type") == "response_item":
+                        if not isinstance(record.get("payload"), dict):
+                            raise ValueError(
+                                f"response_item payload on line {line_number} is not an object"
+                            )
+                        response_items += 1
             item = json.loads(first)
             if item.get("type") != "session_meta" or not isinstance(item.get("payload"), dict):
                 raise ValueError("first JSONL item is not session_meta")
             provider = item["payload"].get("model_provider", "(missing)")
             if not isinstance(provider, str):
                 provider = "(invalid)"
-            items.append(RolloutInfo(path, provider, file_contains(path, ENCRYPTED_TOKEN)))
+            items.append(RolloutInfo(path, provider, encrypted, response_items))
         except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
             unreadable.append((path, str(error)))
     return RolloutScan(tuple(items), tuple(unreadable))
@@ -391,37 +407,78 @@ def changed_rollouts(scan: RolloutScan, provider: str) -> list[RolloutInfo]:
     return [item for item in scan.items if item.provider != provider]
 
 
-def update_rollout(path: Path, provider: str) -> bool:
-    content = path.read_bytes()
-    newline = content.find(b"\n")
-    first = content if newline < 0 else content[:newline]
-    rest = b"" if newline < 0 else content[newline:]
-    item = json.loads(first)
+def update_rollout(path: Path, provider: str) -> RolloutUpdate:
+    lines = path.read_bytes().splitlines(keepends=True)
+    if not lines:
+        raise RuntimeError(f"rollout changed during synchronization: {path}")
+    item = json.loads(lines[0])
     if item.get("type") != "session_meta" or not isinstance(item.get("payload"), dict):
         raise RuntimeError(f"rollout changed during synchronization: {path}")
     payload = item["payload"]
     if payload.get("model_provider") == provider:
-        return False
+        return RolloutUpdate(False)
+    source_provider = payload.get("model_provider")
+    if not isinstance(source_provider, str):
+        source_provider = None
     payload["model_provider"] = provider
-    encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    atomic_write(path, encoded + rest, path.stat().st_mode & 0o7777)
-    return True
+    output = [json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"]
+    removed_items = 0
+    converted_items = 0
+    stripped_ids = 0
+    for line_number, line in enumerate(lines[1:], 2):
+        if b"response_item" not in line:
+            output.append(line)
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"invalid JSON on line {line_number} of {path}: {error}") from error
+        if record.get("type") != "response_item":
+            output.append(line)
+            continue
+        response_payload = record.get("payload")
+        if not isinstance(response_payload, dict):
+            raise RuntimeError(
+                f"response_item payload on line {line_number} of {path} is not an object"
+            )
+        normalized = normalize_response_history(
+            [response_payload],
+            source_provider=source_provider,
+            target_provider=provider,
+        )
+        if not normalized.items:
+            removed_items += 1
+            continue
+        stripped_ids += sum(
+            diagnostic.action == "stripped-id" for diagnostic in normalized.diagnostics
+        )
+        for normalized_item in normalized.items:
+            if normalized_item.get("type") != response_payload.get("type"):
+                converted_items += 1
+            normalized_record = dict(record)
+            normalized_record["payload"] = normalized_item
+            output.append(
+                json.dumps(normalized_record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                + b"\n"
+            )
+    atomic_write(path, b"".join(output), path.stat().st_mode & 0o7777)
+    return RolloutUpdate(True, removed_items, converted_items, stripped_ids)
 
 
-def confirm_encrypted_changes(changes: list[RolloutInfo], assume_yes: bool) -> bool:
-    risky = [item for item in changes if item.encrypted]
+def confirm_history_normalization(changes: list[RolloutInfo], assume_yes: bool) -> bool:
+    risky = [item for item in changes if item.response_items]
     if not risky:
         return assume_yes
     if assume_yes:
         return True
     message = (
-        f"{len(risky)} rollout file(s) contain encrypted_content created under a different "
-        "provider. Synchronizing metadata can restore visibility, but the target provider may "
-        "still be unable to continue or compact those histories."
+        f"{len(risky)} rollout file(s) contain provider-native response items from a different "
+        "provider. The switch will keep portable messages, strip provider-generated IDs, and "
+        "remove opaque reasoning and tool continuation state after creating a rollback backup."
     )
     print(f"WARNING: {message}", file=sys.stderr)
     if not sys.stdin.isatty():
-        raise RuntimeError("confirmation required; review the warning and rerun with --yes")
+        raise RuntimeError("confirmation required; review the normalization warning and rerun with --yes")
     answer = input("Continue after creating a rollback backup? [y/N] ").strip().lower()
     if answer not in {"y", "yes"}:
         raise RuntimeError("cancelled by user")
@@ -596,9 +653,16 @@ def provider_counts(codex_home: Path) -> dict:
     scan = scan_rollouts(codex_home)
     rollout_counts = Counter(item.provider for item in scan.items)
     encrypted_counts = Counter(item.provider for item in scan.items if item.encrypted)
+    response_item_rollouts = Counter(item.provider for item in scan.items if item.response_items)
+    response_items = Counter()
+    for item in scan.items:
+        if item.response_items:
+            response_items[item.provider] += item.response_items
     result: dict = {
         "rollouts": dict(rollout_counts),
         "encrypted_rollouts": dict(encrypted_counts),
+        "response_item_rollouts": dict(response_item_rollouts),
+        "response_items": dict(response_items),
         "unreadable_rollouts": len(scan.unreadable),
         "databases": {},
         "catalog": {},
@@ -697,7 +761,7 @@ def run_sync(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"refusing to continue because {len(initial_scan.unreadable)} rollout file(s) are unreadable: {preview}"
         )
-    risk_accepted = confirm_encrypted_changes(
+    risk_accepted = confirm_history_normalization(
         changed_rollouts(initial_scan, target_provider), args.yes
     )
     if args.no_quit and codex_home == Path("~/.codex").expanduser().resolve() and is_codex_running():
@@ -716,18 +780,21 @@ def run_sync(args: argparse.Namespace) -> None:
         if scan.unreadable:
             raise RuntimeError(f"{len(scan.unreadable)} rollout file(s) became unreadable")
         changes = changed_rollouts(scan, target_provider)
-        confirm_encrypted_changes(changes, risk_accepted)
+        confirm_history_normalization(changes, risk_accepted)
+        source_provider_counts = Counter(item.provider for item in changes)
         backup = create_backup(
             codex_home,
             (item.path for item in changes),
             operation=args.command,
             source_provider=config.provider,
             target_provider=target_provider,
+            source_provider_counts=source_provider_counts,
         )
         try:
             if update_config:
                 set_config_provider(config_path, config, target_provider)
-            changed_count = sum(update_rollout(item.path, target_provider) for item in changes)
+            rollout_updates = [update_rollout(item.path, target_provider) for item in changes]
+            changed_count = sum(update.changed for update in rollout_updates)
             first, second = (codex_home / relative for relative in DB_RELATIVE_PATHS)
             state_path, inserted_rows, reconciled_rows = merge_thread_dbs(first, second)
             db_updates = [
@@ -739,6 +806,9 @@ def run_sync(args: argparse.Namespace) -> None:
             validate_state_files(codex_home)
             result = {
                 "changed_count": changed_count,
+                "removed_items": sum(update.removed_items for update in rollout_updates),
+                "converted_items": sum(update.converted_items for update in rollout_updates),
+                "stripped_ids": sum(update.stripped_ids for update in rollout_updates),
                 "inserted_rows": inserted_rows,
                 "reconciled_rows": reconciled_rows,
                 "provider_rows": sum(item[0] for item in db_updates),
@@ -771,6 +841,9 @@ def run_sync(args: argparse.Namespace) -> None:
     print(f"Provider synchronized: {target_provider}")
     print(f"Backup: {backup}")
     print(f"Rollout files updated: {result['changed_count']}")
+    print(f"Provider-native response items removed: {result['removed_items']}")
+    print(f"Reasoning summaries converted to messages: {result['converted_items']}")
+    print(f"Provider-generated IDs stripped: {result['stripped_ids']}")
     print(f"SQLite rows inserted: {result['inserted_rows']}")
     print(f"SQLite rows reconciled: {result['reconciled_rows']}")
     print(f"SQLite provider rows updated: {result['provider_rows']}")
@@ -857,12 +930,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("backups", help="list rollback backups")
     sync = subparsers.add_parser("sync", help="sync history to the provider already active in config.toml")
     sync.add_argument("provider", nargs="?", help=argparse.SUPPRESS)
-    sync.add_argument("--yes", action="store_true", help="accept encrypted-history compatibility risk")
+    sync.add_argument("--yes", action="store_true", help="accept provider-state normalization")
     sync.add_argument("--keep", type=int, default=5, help="number of rollback backups to retain")
     add_lifecycle_options(sync)
     switch = subparsers.add_parser("switch", help="switch to a provider configured in config.toml and sync history")
     switch.add_argument("provider")
-    switch.add_argument("--yes", action="store_true", help="accept encrypted-history compatibility risk")
+    switch.add_argument("--yes", action="store_true", help="accept provider-state normalization")
     switch.add_argument("--keep", type=int, default=5, help="number of rollback backups to retain")
     add_lifecycle_options(switch)
     restore = subparsers.add_parser("restore", help="restore a rollback backup (latest by default)")

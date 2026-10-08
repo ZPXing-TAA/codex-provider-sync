@@ -14,7 +14,10 @@ class HistoryNormalizerTest(unittest.TestCase):
         history = [{"type": "reasoning", "id": "rs_123", "encrypted_content": "opaque"}]
 
         result = normalize_response_history(
-            history, source_provider="openai", target_provider="openai"
+            history,
+            source_provider="openai",
+            target_provider="openai",
+            continuation_compatible=True,
         )
 
         self.assertEqual(result.items, history)
@@ -138,6 +141,7 @@ class HistoryNormalizerTest(unittest.TestCase):
                 [{"type": "function_call_output", "call_id": "call_missing", "output": "x"}],
                 source_provider="openai",
                 target_provider="openai",
+                continuation_compatible=True,
             )
 
     def test_same_provider_rejects_wrong_openai_reasoning_namespace(self):
@@ -146,6 +150,7 @@ class HistoryNormalizerTest(unittest.TestCase):
                 [{"type": "reasoning", "id": "item_foreign"}],
                 source_provider="openai",
                 target_provider="openai",
+                continuation_compatible=True,
             )
 
     def test_same_provider_rejects_wrong_openai_message_namespace(self):
@@ -154,7 +159,40 @@ class HistoryNormalizerTest(unittest.TestCase):
                 [{"type": "message", "role": "assistant", "id": "item_foreign", "content": []}],
                 source_provider="openai",
                 target_provider="openai",
+                continuation_compatible=True,
             )
+
+    def test_same_provider_name_without_continuation_proof_is_sanitized(self):
+        result = normalize_response_history(
+            [{"type": "reasoning", "id": "rs_123", "encrypted_content": "opaque"}],
+            source_provider="openai",
+            target_provider="openai",
+        )
+
+        self.assertEqual(result.items, [])
+
+    def test_same_provider_name_with_different_route_is_sanitized(self):
+        result = normalize_response_history(
+            [{"type": "message", "role": "assistant", "id": "msg_123", "content": []}],
+            source_provider="openai",
+            target_provider="openai",
+            source_endpoint="https://chatgpt.com/backend-api/codex",
+            target_endpoint="https://api.openai.com/v1",
+            source_transport="websocket",
+            target_transport="http",
+            continuation_compatible=True,
+        )
+
+        self.assertEqual(result.items, [{"type": "message", "role": "assistant", "content": []}])
+
+    def test_cross_provider_strips_standard_looking_ids(self):
+        result = normalize_response_history(
+            [{"type": "message", "role": "assistant", "id": "msg_looks_valid", "content": []}],
+            source_provider="custom",
+            target_provider="openai",
+        )
+
+        self.assertEqual(result.items, [{"type": "message", "role": "assistant", "content": []}])
 
     def test_missing_provenance_is_conservative(self):
         persisted = PersistedResponseHistory(

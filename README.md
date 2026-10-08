@@ -30,7 +30,7 @@ After a provider change, these layers can disagree about `model_provider`. On af
 ## What it does
 
 - Reports provider counts across rollout files, both known thread databases, and the sidebar catalog.
-- Synchronizes rollout `session_meta` records to the provider already selected in `config.toml`.
+- Normalizes provider-bound response items, then synchronizes rollout `session_meta` records to the selected provider.
 - Merges missing thread IDs between both `state_5.sqlite` locations.
 - Reconciles conflicting shared metadata using the newer thread record.
 - Repairs user-event visibility flags and rebuilds the local sidebar catalog.
@@ -39,7 +39,7 @@ After a provider change, these layers can disagree about `model_provider`. On af
 - Rolls back automatically if a write or validation step fails.
 - Provides explicit backup listing and restore commands.
 
-It does **not** configure provider credentials, decrypt provider-bound history, or merge separate forked threads into one conversation.
+It does **not** configure provider credentials, translate encrypted reasoning state, or merge separate forked threads into one conversation.
 
 ## Responses API history normalization
 
@@ -57,6 +57,15 @@ normalized = normalize_response_history(
     target_provider=active_provider,
     source_endpoint=session_source_endpoint,
     source_model=session_source_model,
+    source_auth_mode=session_source_auth_mode,
+    source_transport=session_source_transport,
+    source_continuation_scope=session_continuation_scope,
+    target_endpoint=active_endpoint,
+    target_model=active_model,
+    target_auth_mode=active_auth_mode,
+    target_transport=active_transport,
+    target_continuation_scope=active_continuation_scope,
+    continuation_compatible=same_authenticated_continuation_domain,
 )
 request_input = normalized.items
 ```
@@ -65,15 +74,15 @@ The normalizer keeps provenance out of the API payload. When providers differ,
 it preserves ordinary message content, removes provider-generated IDs, drops
 opaque reasoning/compaction state (retaining a visible summary when one is
 available), and removes tool-call state as a complete unit. It never rewrites
-an ID prefix such as `item_` to `rs_`. When the provider is unchanged, it
-preserves native state but validates OpenAI reasoning namespaces and tool-call
-relationships before serialization. Sessions without provenance are treated
-as cross-provider for safety.
+an ID prefix such as `item_` to `rs_`. It preserves native state only when the
+request host explicitly confirms that the source and target share the same
+authenticated continuation domain; a matching provider name or ID prefix is
+not enough. Preserved state is still checked for valid OpenAI item namespaces
+and tool-call relationships. Missing provenance is treated conservatively.
 
-This repository does not contain Codex Desktop's private request serializer,
-so the normalizer must be called by the host immediately before it builds the
-Responses API `input` array. `codex-switch sync` alone repairs local metadata;
-it cannot intercept a separately implemented request path.
+`codex-switch` also applies this normalization when it migrates rollout files.
+The reusable function should still be called by any other host that loads raw
+persisted items immediately before it builds the Responses API `input` array.
 
 ## Requirements
 
@@ -121,7 +130,7 @@ codex-switch sync
 
 The command will:
 
-1. warn before relabeling histories that contain `encrypted_content`;
+1. warn before normalizing histories that contain provider-native response items;
 2. quit Codex;
 3. create a rollback backup;
 4. reconcile rollout metadata, databases, and the sidebar catalog;
@@ -149,7 +158,7 @@ codex-switch switch custom
 
 Useful options:
 
-- `--yes`: acknowledge the encrypted-history compatibility warning non-interactively.
+- `--yes`: accept provider-state normalization non-interactively.
 - `--keep N`: retain the newest `N` rollback backups. The default is 5.
 - `--no-open`: do not reopen Codex after the operation.
 - `--codex-home PATH`: inspect or operate on another Codex home. Place this global option before the command.
@@ -168,6 +177,8 @@ Example:
 {
   "config_provider": "openai",
   "rollouts": {"openai": 214},
+  "response_item_rollouts": {"openai": 203},
+  "response_items": {"openai": 15482},
   "databases": {
     "state_5.sqlite": {"openai": 212},
     "sqlite/state_5.sqlite": {"openai": 164}
@@ -197,7 +208,7 @@ Each backup contains:
 - `config.toml` when present;
 - SQLite-consistent copies of the known databases;
 - only the rollout files that the operation will modify;
-- a manifest describing the source provider, target provider, and backed-up paths.
+- a manifest describing the actual rollout source-provider counts, target provider, and backed-up paths.
 
 List backups:
 
@@ -219,17 +230,19 @@ codex-switch restore ~/.codex/recovery_backups/<timestamp>-codex-switch
 
 Before restoring, the tool creates another safety backup of the current state, so a restore can itself be undone.
 
-## Encrypted history limitation
+## Provider-bound history
 
-Some rollout files contain `encrypted_content` created by a specific provider or account. Changing `session_meta.model_provider` can make the history visible under the selected provider, but it does not transform or decrypt that encrypted payload.
+Response IDs, encrypted reasoning, compaction state, and tool-call continuation state may be valid only for the provider, account, endpoint, transport, or live connection that produced them. Replaying them after a switch can cause errors such as `invalid_id_prefix` or `persisted-item lookup ... not supported`.
 
-Consequences:
+For each rollout that actually changes provider, version 0.3.1:
 
-- a restored conversation may be visible but fail when continued;
-- compaction may fail with an encrypted-content validation error;
-- returning to the original provider/account may still be required.
+- keeps ordinary user, assistant, system, and developer message content;
+- strips provider-generated IDs from portable messages;
+- converts a visible reasoning summary to an ordinary assistant message;
+- removes opaque reasoning, compaction, unknown provider state, and tool-call pairs;
+- records the untouched original in the rollback backup first.
 
-The confirmation prompt exists to make this distinction explicit. `--yes` acknowledges the risk; it does not remove it.
+This trades provider-native continuation efficiency and historical tool traces for portable conversational context. `--yes` accepts that normalization; it never makes opaque state portable.
 
 ## Files modified
 
@@ -237,7 +250,7 @@ Depending on which files exist, synchronization may update:
 
 ```text
 ~/.codex/config.toml                 # switch only
-~/.codex/sessions/**/*.jsonl         # first session_meta record only
+~/.codex/sessions/**/*.jsonl         # session_meta + cross-provider response-item normalization
 ~/.codex/archived_sessions/*.jsonl
 ~/.codex/state_5.sqlite
 ~/.codex/sqlite/state_5.sqlite
@@ -258,7 +271,7 @@ Define the provider in `~/.codex/config.toml` first. The tool intentionally does
 
 ### `confirmation required`
 
-The command detected provider-mismatched rollout files containing encrypted history while running non-interactively. Review the limitation above, then rerun with `--yes` only if the visibility repair is what you want.
+The command detected provider-mismatched rollout files containing provider-native response items while running non-interactively. Review the normalization rules above, then rerun with `--yes`.
 
 ### Codex did not reopen
 
@@ -278,7 +291,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-The test suite uses isolated temporary Codex homes and covers provider validation, TOML root-key handling, encrypted-history confirmation, database reconciliation, idempotency, automatic rollback, App reopening, explicit restore, and provider-aware Responses API history normalization.
+The test suite uses isolated temporary Codex homes and covers provider validation, TOML root-key handling, provider-state confirmation and migration, database reconciliation, idempotency, automatic rollback, App reopening, explicit restore, and provider-aware Responses API history normalization.
 
 ## Project status
 

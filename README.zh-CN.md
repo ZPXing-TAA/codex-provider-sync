@@ -30,7 +30,7 @@ Codex 的本地聊天历史分布在几层状态中：
 ## 它会做什么
 
 - 统计 rollout、两套线程数据库和侧栏目录中的 provider 分布。
-- 将 rollout 的 `session_meta` 同步到 `config.toml` 当前选中的 provider。
+- 先规范化 provider 绑定的 response item，再将 rollout 的 `session_meta` 同步到目标 provider。
 - 在两套 `state_5.sqlite` 之间补齐缺失的任务 ID。
 - 对同一任务的冲突元数据选择更新时间更晚的记录。
 - 修复用户事件可见标记并重建本地侧栏目录。
@@ -39,7 +39,7 @@ Codex 的本地聊天历史分布在几层状态中：
 - 写入或校验失败时自动回滚。
 - 提供备份列表和显式恢复命令。
 
-它**不会**配置 provider 凭据、解密与 provider 绑定的历史，也不会把多个分叉任务合并成一条对话。
+它**不会**配置 provider 凭据、翻译加密 reasoning 状态，也不会把多个分叉任务合并成一条对话。
 
 ## Responses API 历史规范化
 
@@ -54,13 +54,22 @@ normalized = normalize_response_history(
     target_provider=active_provider,
     source_endpoint=session_source_endpoint,
     source_model=session_source_model,
+    source_auth_mode=session_source_auth_mode,
+    source_transport=session_source_transport,
+    source_continuation_scope=session_continuation_scope,
+    target_endpoint=active_endpoint,
+    target_model=active_model,
+    target_auth_mode=active_auth_mode,
+    target_transport=active_transport,
+    target_continuation_scope=active_continuation_scope,
+    continuation_compatible=same_authenticated_continuation_domain,
 )
 request_input = normalized.items
 ```
 
-规范化器会把 provenance 与 API payload 分开保存。跨 provider 时保留普通消息内容，删除 provider 生成的 ID，丢弃不透明的 reasoning/compaction 状态（如果有可见 summary，则保留为普通文本），并成对删除 tool-call 状态。它不会把 `item_` 之类的 ID 前缀直接改成 `rs_`。同一 provider 时保留原生状态，但会在序列化前校验 OpenAI reasoning 命名空间和 tool-call 关系。缺少 provenance 的旧会话会按跨 provider 保守处理。
+规范化器会把 provenance 与 API payload 分开保存。continuation 不兼容时保留普通消息内容，删除 provider 生成的 ID，丢弃不透明的 reasoning/compaction 状态（如果有可见 summary，则保留为普通文本），并成对删除 tool-call 状态。它不会把 `item_` 之类的 ID 前缀直接改成 `rs_`。只有请求宿主明确确认来源与目标属于同一个已认证 continuation 域时，才保留原生状态；provider 名称相同或 ID 前缀看起来正确都不够。缺少 provenance 的旧会话会按不兼容保守处理。
 
-当前仓库不包含 Codex Desktop 私有的请求序列化器，因此规范化器需要由实际请求宿主在构造 Responses API `input` 数组前调用。单独运行 `codex-switch sync` 只能修复本地元数据，不能拦截另一条请求路径。
+`codex-switch` 在迁移 rollout 时也会实际执行这套规范化。其他读取原始持久化 item 的宿主，仍应在构造 Responses API `input` 数组之前调用这个函数。
 
 ## 环境要求
 
@@ -108,7 +117,7 @@ codex-switch sync
 
 命令会依次：
 
-1. 对包含 `encrypted_content` 的跨 provider 历史发出警告；
+1. 对包含 provider 原生 response item 的跨 provider 历史发出规范化提示；
 2. 退出 Codex；
 3. 创建回滚备份；
 4. 同步 rollout、两套数据库和侧栏目录；
@@ -136,7 +145,7 @@ codex-switch switch custom
 
 常用选项：
 
-- `--yes`：在非交互环境中确认已理解加密历史兼容风险。
+- `--yes`：在非交互环境中接受 provider 原生状态规范化。
 - `--keep N`：保留最新 `N` 份备份，默认 5。
 - `--no-open`：操作结束后不重新打开 Codex。
 - `--codex-home PATH`：操作另一个 Codex home；这是全局选项，应写在子命令前面。
@@ -155,6 +164,8 @@ codex-switch --codex-home /path/to/test-home status --json
 {
   "config_provider": "openai",
   "rollouts": {"openai": 214},
+  "response_item_rollouts": {"openai": 203},
+  "response_items": {"openai": 15482},
   "databases": {
     "state_5.sqlite": {"openai": 212},
     "sqlite/state_5.sqlite": {"openai": 164}
@@ -184,7 +195,7 @@ codex-switch --codex-home /path/to/test-home status --json
 - 存在时的 `config.toml`；
 - 两套状态库和侧栏数据库的 SQLite 一致性副本；
 - 本次将要修改的 rollout 文件；
-- 记录来源 provider、目标 provider 和文件路径的 manifest。
+- 记录 rollout 实际来源 provider 数量、目标 provider 和文件路径的 manifest。
 
 查看备份：
 
@@ -206,17 +217,19 @@ codex-switch restore ~/.codex/recovery_backups/<timestamp>-codex-switch
 
 恢复前，工具还会先备份当前状态，因此恢复操作本身也可以撤销。
 
-## 加密历史限制
+## Provider 绑定历史
 
-部分 rollout 包含由特定 provider 或账号生成的 `encrypted_content`。修改 `session_meta.model_provider` 可以恢复它在目标 provider 下的可见性，但不会转换或解密加密载荷。
+response ID、加密 reasoning、compaction 状态和 tool-call continuation 状态，可能只对生成它们的 provider、账号、endpoint、transport 或当前连接有效。切换后原样重放，可能触发 `invalid_id_prefix` 或 `persisted-item lookup ... not supported`。
 
-因此：
+对于实际发生 provider 变化的 rollout，0.3.1 会：
 
-- 对话可能恢复显示，但继续对话时失败；
-- 自动压缩可能触发 encrypted-content 校验错误；
-- 最终仍可能需要返回原 provider/账号。
+- 保留普通的 user、assistant、system、developer 消息内容；
+- 删除可移植消息上的 provider 生成 ID；
+- 把可见 reasoning summary 转成普通 assistant 消息；
+- 删除不透明 reasoning、compaction、未知 provider 状态和 tool-call 对；
+- 修改前先把原始内容完整放进回滚备份。
 
-确认提示是为了明确这一区别。`--yes` 只是确认你已知风险，不会消除风险。
+这会牺牲原 provider 的 continuation 效率和历史工具调用轨迹，但保留可移植的对话语义。`--yes` 表示接受这次规范化，并不会让不透明状态变得可移植。
 
 ## 会修改哪些文件
 
@@ -224,7 +237,7 @@ codex-switch restore ~/.codex/recovery_backups/<timestamp>-codex-switch
 
 ```text
 ~/.codex/config.toml                 # 仅 switch
-~/.codex/sessions/**/*.jsonl         # 只修改第一条 session_meta
+~/.codex/sessions/**/*.jsonl         # session_meta + 跨 provider response-item 规范化
 ~/.codex/archived_sessions/*.jsonl
 ~/.codex/state_5.sqlite
 ~/.codex/sqlite/state_5.sqlite
@@ -245,7 +258,7 @@ codex-switch restore ~/.codex/recovery_backups/<timestamp>-codex-switch
 
 ### `confirmation required`
 
-非交互运行时检测到了包含加密内容、且 provider 不匹配的 rollout。阅读上面的限制后，如果你确实要修复可见性，再使用 `--yes`。
+非交互运行时检测到了包含 provider 原生 response item、且 provider 不匹配的 rollout。阅读上面的规范化规则后，再使用 `--yes`。
 
 ### Codex 没有重新打开
 
@@ -265,7 +278,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、加密历史确认、双库冲突合并、幂等、自动回滚、App 重开、显式恢复，以及 Responses API 历史的 provider-aware 规范化。
+测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、provider 原生状态确认与迁移、双库冲突合并、幂等、自动回滚、App 重开、显式恢复，以及 Responses API 历史的 provider-aware 规范化。
 
 ## 项目状态
 
