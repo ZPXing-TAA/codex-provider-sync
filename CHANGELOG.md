@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 - Unreleased
+
+This is a safety-focused breaking change. **Do not use versions <= 0.3.2 on real Codex data.** They could delete provider-native history, relabel unrelated thread metadata, and overwrite newer state during restore. Preserve all existing recovery backups and upgrade before attempting recovery.
+
+- Change `switch` to update only the root default provider. It backs up config, every known database, and all rollout files; it no longer rewrites history, thread provenance, or sidebar indexes.
+- Allow `switch` with no provider argument to auto-toggle only when exactly one OpenAI and one custom provider are configured. Ambiguous provider setups require an explicit target.
+- Change `sync` to reconcile indexes from per-rollout provider provenance, retain mixed-provider state, and leave unmatched catalog rows intact.
+- Make restore additive: restore missing rollout files/DB rows while preserving current data; recover known normalized snapshots only when the original and appended suffix are unambiguous; report and leave conflicts untouched.
+- Restore only the root provider setting instead of replacing the entire current config. Create a full safety backup of current data before restore.
+- Disable backup pruning by default. Explicit `--keep` applies only to v4-format switch/sync backups and protects legacy/recovery backups.
+- Keep history normalization out of CLI mutation paths. Switching providers does not make native history portable or guarantee cross-provider continuation/lineage repair.
+
 ## 0.3.2 - 2026-10-08
 
 - Make `codex-switch sync` automatically detect the target from the active `config.toml` provider and proceed without a confirmation prompt.

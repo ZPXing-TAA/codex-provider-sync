@@ -19,7 +19,6 @@ import time
 from typing import Iterable, Mapping
 
 from . import __version__
-from .history import normalize_response_history
 
 try:
     import tomllib
@@ -52,20 +51,13 @@ class RolloutInfo:
     provider: str
     encrypted: bool
     response_items: int
+    thread_id: str | None
 
 
 @dataclass(frozen=True)
 class RolloutScan:
     items: tuple[RolloutInfo, ...]
     unreadable: tuple[tuple[Path, str], ...]
-
-
-@dataclass(frozen=True)
-class RolloutUpdate:
-    changed: bool
-    removed_items: int = 0
-    converted_items: int = 0
-    stripped_ids: int = 0
 
 
 def quote_identifier(value: str) -> str:
@@ -280,14 +272,13 @@ def create_backup(
             shutil.copy2(source, destination)
             manifest_rollouts.append(str(relative))
         counts = dict(source_provider_counts or {})
-        if counts:
-            source_provider = next(iter(counts)) if len(counts) == 1 else "(mixed)"
         manifest = {
-            "version": 3,
+            "version": 4,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "operation": operation,
             "source_provider": source_provider,
             "source_provider_counts": counts,
+            "history_policy": "preserve-native-history",
             "target_provider": target_provider,
             "databases": backed_up_databases,
             "absent_databases": absent_databases,
@@ -317,7 +308,8 @@ def read_backup_manifest(backup: Path) -> dict:
     return manifest
 
 
-def restore_backup(codex_home: Path, backup: Path) -> None:
+def _rollback_snapshot(codex_home: Path, backup: Path) -> None:
+    """Private failure rollback only: Codex is closed and no new work can exist."""
     manifest = read_backup_manifest(backup)
     config = backup / "config.toml"
     if config.exists():
@@ -354,9 +346,207 @@ def restore_backup(codex_home: Path, backup: Path) -> None:
         (codex_home / relative).unlink(missing_ok=True)
 
 
-def prune_backups(codex_home: Path, keep: int) -> int:
+def _rollout_signature(line: bytes, provider: str | None = None) -> str:
+    record = json.loads(line)
+    if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict):
+        if provider is not None:
+            record["payload"]["model_provider"] = provider
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def legacy_normalized_signatures(lines: list[bytes], provider: str) -> list[str]:
+    """Recognize 0.3.1/0.3.2's exact lossy rewrite; never persist its output."""
+    from .history import normalize_response_history
+
+    first = json.loads(lines[0])
+    source_provider = first.get("payload", {}).get("model_provider")
+    signatures = [_rollout_signature(lines[0], provider)]
+    for line in lines[1:]:
+        record = json.loads(line)
+        if record.get("type") != "response_item":
+            signatures.append(_rollout_signature(line))
+            continue
+        result = normalize_response_history(
+            [record["payload"]], source_provider=source_provider, target_provider=provider
+        )
+        for payload in result.items:
+            signatures.append(json.dumps(
+                {**record, "payload": payload}, ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ))
+    return signatures
+
+
+def restore_rollout(
+    codex_home: Path, backup: Path, relative: Path, *, allow_legacy_projection: bool = False
+) -> tuple[bool, bool]:
+    source = backup / "rollouts" / relative
+    destination = codex_home / relative
+    if not source.is_file():
+        raise RuntimeError(f"rollout is missing from backup: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        atomic_copy(source, destination)
+        return True, False
+    base = source.read_bytes().splitlines(keepends=True)
+    current = destination.read_bytes().splitlines(keepends=True)
+    if base == current:
+        return False, False
+    try:
+        base_meta = json.loads(base[0]).get("payload", {})
+        current_meta = json.loads(current[0]).get("payload", {})
+        if not base_meta.get("id") or base_meta.get("id") != current_meta.get("id"):
+            return False, True
+        base_provider = base_meta.get("model_provider")
+        base_signatures = [_rollout_signature(line) for line in base]
+        current_signatures = [
+            _rollout_signature(line, base_provider) if index == 0 else _rollout_signature(line)
+            for index, line in enumerate(current)
+        ]
+        candidates = [base_signatures]
+        current_provider = current_meta.get("model_provider")
+        if allow_legacy_projection and isinstance(base_provider, str) and isinstance(current_provider, str):
+            normalized = legacy_normalized_signatures(base, current_provider)
+            normalized[0] = _rollout_signature(base[0], base_provider)
+            candidates.append(normalized)
+    except (IndexError, KeyError, TypeError, AttributeError, json.JSONDecodeError, UnicodeDecodeError):
+        return False, True
+    # Prefer the longest forward prefix.  A lossy projection is shorter than
+    # the raw backup, and choosing it when the raw prefix already matches
+    # would duplicate the current suffix.
+    matched = max(
+        (candidate for candidate in candidates
+         if len(current_signatures) >= len(candidate)
+         and current_signatures[:len(candidate)] == candidate),
+        key=len,
+        default=None,
+    )
+    if matched is not None:
+        suffix = current[len(matched):]
+        content = b"".join(base)
+    elif (
+        len(base_signatures) > len(current_signatures)
+        and base_signatures[:len(current_signatures)] == current_signatures
+    ):
+        content = b"".join(base)
+        suffix = []
+    else:
+        # A pre-restore snapshot can itself be the old lossy projection while
+        # the live file has since been recovered to the complete native
+        # history.  In that direction preserve the complete live bytes and
+        # append only an unambiguous suffix that follows its normalized form.
+        normalized_current = None
+        if allow_legacy_projection and isinstance(base_provider, str) and isinstance(current_provider, str):
+            normalized_current = legacy_normalized_signatures(current, base_provider)
+        if (
+            normalized_current is None
+            or normalized_current == current_signatures
+            or len(base_signatures) <= len(normalized_current)
+            or base_signatures[:len(normalized_current)] != normalized_current
+        ):
+            return False, True
+        suffix = base[len(normalized_current):]
+        content = b"".join(current)
+
+    if suffix and content and not content.endswith(b"\n"):
+        content += b"\n"
+    atomic_write(destination, content + b"".join(suffix), destination.stat().st_mode & 0o7777)
+    return True, False
+
+
+def restore_backup(codex_home: Path, backup: Path) -> tuple[int, int, int]:
+    """Merge an old backup into the current home without dropping later threads."""
+    manifest = read_backup_manifest(backup)
+    allow_legacy_projection = (
+        manifest.get("version") == 3
+        and manifest.get("operation") in {"switch", "sync", "pre-restore"}
+        and isinstance(manifest.get("source_provider"), str)
+        and isinstance(manifest.get("target_provider"), str)
+        and manifest.get("source_provider") != manifest.get("target_provider")
+    )
+    config_backup = backup / "config.toml"
+    if config_backup.is_file():
+        original = read_config(config_backup)
+        current_path = codex_home / "config.toml"
+        current = read_config(current_path)
+        if original.provider not in current.configured_providers:
+            available = ", ".join(sorted(current.configured_providers))
+            raise RuntimeError(
+                f"backup provider {original.provider!r} is not configured in the current config.toml; "
+                f"available: {available}"
+            )
+    restored_rollouts = 0
+    rollout_conflicts = 0
+    for value in manifest.get("rollouts", []):
+        restored, conflict = restore_rollout(
+            codex_home, backup, safe_relative_path(str(value)),
+            allow_legacy_projection=allow_legacy_projection,
+        )
+        restored_rollouts += int(restored)
+        rollout_conflicts += int(conflict)
+        if conflict:
+            print(f"Conflict left unchanged: {value}", file=sys.stderr)
+
+    if config_backup.is_file():
+        set_config_provider(current_path, current, original.provider)
+
+    scan = scan_rollouts(codex_home)
+    if scan.unreadable:
+        raise RuntimeError(f"{len(scan.unreadable)} rollout file(s) are unreadable after recovery")
+    rollout_ids = Counter(item.thread_id for item in scan.items if item.thread_id)
+    allowed_thread_ids = {thread_id for thread_id, count in rollout_ids.items() if count == 1}
+
+    database_values = manifest.get("databases")
+    if not isinstance(database_values, list):
+        database_values = [str(relative) for relative in DB_RELATIVE_PATHS]
+    for value in database_values:
+        relative = safe_relative_path(str(value))
+        if relative == CATALOG_RELATIVE_PATH:
+            continue
+        source = backup / relative
+        if not source.exists() or "threads" not in sqlite_tables(source):
+            continue
+        destination = codex_home / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            sqlite_backup(source, destination)
+            with sqlite3.connect(destination) as db:
+                for (thread_id,) in db.execute("SELECT id FROM threads").fetchall():
+                    if thread_id not in allowed_thread_ids:
+                        db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+        elif "threads" in sqlite_tables(destination):
+            copy_thread_rows(
+                destination, source, missing_only=True, allowed_ids=allowed_thread_ids
+            )
+
+    catalog_destination = codex_home / CATALOG_RELATIVE_PATH
+    catalog_source = backup / CATALOG_RELATIVE_PATH
+    if catalog_source.exists():
+        if not catalog_destination.exists():
+            sqlite_backup(catalog_source, catalog_destination)
+            filter_catalog_rows(catalog_destination, allowed_thread_ids)
+        else:
+            merge_missing_catalog_rows(catalog_destination, catalog_source, allowed_thread_ids)
+
+    first, second = (codex_home / relative for relative in DB_RELATIVE_PATHS)
+    state_path, _, _ = merge_thread_dbs(first, second, missing_only=True)
+    for path in (first, second):
+        if path.exists():
+            update_thread_db(path, scan)
+    rebuild_catalog(codex_home, state_path)
+    return restored_rollouts, rollout_conflicts, len(scan.items)
+
+
+def prune_backups(codex_home: Path, keep: int | None) -> int:
     removed = 0
-    for old in backup_paths(codex_home)[keep:]:
+    if keep is None:
+        return 0
+    eligible = [
+        path for path in backup_paths(codex_home)
+        if read_backup_manifest(path).get("version") == 4
+        and read_backup_manifest(path).get("operation") in {"sync", "switch"}
+    ]
+    for old in eligible[keep:]:
         shutil.rmtree(old)
         removed += 1
     return removed
@@ -397,84 +587,21 @@ def scan_rollouts(codex_home: Path) -> RolloutScan:
             provider = item["payload"].get("model_provider", "(missing)")
             if not isinstance(provider, str):
                 provider = "(invalid)"
-            items.append(RolloutInfo(path, provider, encrypted, response_items))
+            thread_id = item["payload"].get("id")
+            if not isinstance(thread_id, str):
+                thread_id = None
+            items.append(RolloutInfo(path, provider, encrypted, response_items, thread_id))
         except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
             unreadable.append((path, str(error)))
     return RolloutScan(tuple(items), tuple(unreadable))
 
 
-def changed_rollouts(scan: RolloutScan, provider: str) -> list[RolloutInfo]:
-    return [item for item in scan.items if item.provider != provider]
-
-
-def update_rollout(path: Path, provider: str) -> RolloutUpdate:
-    lines = path.read_bytes().splitlines(keepends=True)
-    if not lines:
-        raise RuntimeError(f"rollout changed during synchronization: {path}")
-    item = json.loads(lines[0])
-    if item.get("type") != "session_meta" or not isinstance(item.get("payload"), dict):
-        raise RuntimeError(f"rollout changed during synchronization: {path}")
-    payload = item["payload"]
-    if payload.get("model_provider") == provider:
-        return RolloutUpdate(False)
-    source_provider = payload.get("model_provider")
-    if not isinstance(source_provider, str):
-        source_provider = None
-    payload["model_provider"] = provider
-    output = [json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"]
-    removed_items = 0
-    converted_items = 0
-    stripped_ids = 0
-    for line_number, line in enumerate(lines[1:], 2):
-        if b"response_item" not in line:
-            output.append(line)
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"invalid JSON on line {line_number} of {path}: {error}") from error
-        if record.get("type") != "response_item":
-            output.append(line)
-            continue
-        response_payload = record.get("payload")
-        if not isinstance(response_payload, dict):
-            raise RuntimeError(
-                f"response_item payload on line {line_number} of {path} is not an object"
-            )
-        normalized = normalize_response_history(
-            [response_payload],
-            source_provider=source_provider,
-            target_provider=provider,
-        )
-        if not normalized.items:
-            removed_items += 1
-            continue
-        stripped_ids += sum(
-            diagnostic.action == "stripped-id" for diagnostic in normalized.diagnostics
-        )
-        for normalized_item in normalized.items:
-            if normalized_item.get("type") != response_payload.get("type"):
-                converted_items += 1
-            normalized_record = dict(record)
-            normalized_record["payload"] = normalized_item
-            output.append(
-                json.dumps(normalized_record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                + b"\n"
-            )
-    atomic_write(path, b"".join(output), path.stat().st_mode & 0o7777)
-    return RolloutUpdate(True, removed_items, converted_items, stripped_ids)
-
-
-def report_history_normalization(changes: list[RolloutInfo]) -> None:
-    risky = [item for item in changes if item.response_items]
-    if not risky:
-        return
-    message = (
-        f"{len(risky)} rollout file(s) contain provider-native response items from a different "
-        "provider. The switch will keep portable messages, strip provider-generated IDs, and "
-        "remove opaque reasoning and tool continuation state after creating a rollback backup."
-    )
-    print(f"Provider-state normalization: {message}", file=sys.stderr)
+def matched_rollout(row_id: str, scan: RolloutScan) -> RolloutInfo | None:
+    matches = [item for item in scan.items if item.thread_id == row_id]
+    if len(matches) != 1:
+        return None
+    item = matches[0]
+    return item if PROVIDER_PATTERN.fullmatch(item.provider) else None
 
 
 def source_recency_expression(alias: str, columns: set[str]) -> str:
@@ -483,7 +610,10 @@ def source_recency_expression(alias: str, columns: set[str]) -> str:
     return f"{alias}.updated_at*1000"
 
 
-def copy_thread_rows(destination: Path, source: Path, *, overwrite_existing: bool) -> tuple[int, int]:
+def copy_thread_rows(
+    destination: Path, source: Path, *, missing_only: bool = False,
+    allowed_ids: set[str] | None = None,
+) -> tuple[int, int]:
     with sqlite3.connect(destination, timeout=15) as db:
         db.execute("PRAGMA busy_timeout=15000")
         db.execute("ATTACH DATABASE ? AS source_db", (str(source),))
@@ -498,27 +628,34 @@ def copy_thread_rows(destination: Path, source: Path, *, overwrite_existing: boo
             if "id" not in destination_columns or "id" not in source_columns:
                 raise RuntimeError("threads table does not contain an id column")
             quoted = ",".join(quote_identifier(column) for column in common)
+            source_filter = " WHERE 1"
+            if allowed_ids is not None:
+                db.execute("CREATE TEMP TABLE allowed_thread_ids (id TEXT PRIMARY KEY)")
+                db.executemany(
+                    "INSERT INTO allowed_thread_ids(id) VALUES (?)",
+                    ((thread_id,) for thread_id in allowed_ids),
+                )
+                db.commit()
+                source_filter = " WHERE id IN (SELECT id FROM allowed_thread_ids)"
             db.execute("BEGIN IMMEDIATE")
             inserted = db.execute(
-                f"INSERT OR IGNORE INTO main.threads ({quoted}) SELECT {quoted} FROM source_db.threads"
+                f"INSERT INTO main.threads ({quoted}) "
+                f"SELECT {quoted} FROM source_db.threads{source_filter} "
+                "ON CONFLICT(id) DO NOTHING"
             ).rowcount
-            mutable = [column for column in common if column != "id"]
+            if missing_only:
+                db.commit()
+                return inserted, 0
+            # Provenance is repaired from rollouts, never copied over existing rows.
+            mutable = [column for column in common if column not in {"id", "model_provider"}]
             assignments = ",".join(
                 f"{quote_identifier(column)}=(SELECT s.{quote_identifier(column)} "
                 f"FROM source_db.threads s WHERE s.id=threads.id)"
                 for column in mutable
             )
-            condition = ""
-            if overwrite_existing:
-                differences = " OR ".join(
-                    f"s.{quote_identifier(column)} IS NOT threads.{quote_identifier(column)}"
-                    for column in mutable
-                )
-                condition = f" AND ({differences})"
-            else:
-                source_recency = source_recency_expression("s", source_columns)
-                destination_recency = source_recency_expression("threads", destination_columns)
-                condition = f" AND {source_recency}>{destination_recency}"
+            source_recency = source_recency_expression("s", source_columns)
+            destination_recency = source_recency_expression("threads", destination_columns)
+            condition = f" AND {source_recency}>{destination_recency}"
             updated = db.execute(
                 f"UPDATE main.threads AS threads SET {assignments} "
                 "WHERE EXISTS (SELECT 1 FROM source_db.threads s "
@@ -526,11 +663,16 @@ def copy_thread_rows(destination: Path, source: Path, *, overwrite_existing: boo
             ).rowcount
             db.commit()
             return inserted, updated
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.execute("DETACH DATABASE source_db")
 
 
-def merge_thread_dbs(first: Path, second: Path) -> tuple[Path | None, int, int]:
+def merge_thread_dbs(
+    first: Path, second: Path, *, missing_only: bool = False
+) -> tuple[Path | None, int, int]:
     existing = [path for path in (first, second) if path.exists()]
     if not existing:
         return None, 0, 0
@@ -539,10 +681,10 @@ def merge_thread_dbs(first: Path, second: Path) -> tuple[Path | None, int, int]:
     primary = max(existing, key=thread_db_rank)
     secondary = second if primary == first else first
     inserted_primary, updated_primary = copy_thread_rows(
-        primary, secondary, overwrite_existing=False
+        primary, secondary, missing_only=missing_only
     )
     inserted_secondary, updated_secondary = copy_thread_rows(
-        secondary, primary, overwrite_existing=True
+        secondary, primary, missing_only=missing_only
     )
     return (
         primary,
@@ -551,19 +693,75 @@ def merge_thread_dbs(first: Path, second: Path) -> tuple[Path | None, int, int]:
     )
 
 
-def update_thread_db(path: Path, provider: str) -> tuple[int, int]:
+def merge_missing_catalog_rows(destination: Path, source: Path, allowed_ids: set[str]) -> None:
+    with sqlite3.connect(destination, timeout=15) as db:
+        db.execute("ATTACH DATABASE ? AS source_db", (str(source),))
+        try:
+            table = "local_thread_catalog"
+            if table not in connection_tables(db) or table not in connection_tables(db, "source_db"):
+                return
+            source_columns = set(table_columns(db, "source_db", table))
+            common = [column for column in table_columns(db, "main", table) if column in source_columns]
+            columns = ",".join(quote_identifier(column) for column in common)
+            db.execute("CREATE TEMP TABLE allowed_thread_ids (id TEXT PRIMARY KEY)")
+            db.executemany(
+                "INSERT INTO allowed_thread_ids(id) VALUES (?)",
+                ((thread_id,) for thread_id in allowed_ids),
+            )
+            db.execute(
+                f"INSERT INTO main.{table} ({columns}) SELECT {columns} "
+                f"FROM source_db.{table} WHERE host_id='local' AND thread_id IN "
+                "(SELECT id FROM allowed_thread_ids) "
+                "ON CONFLICT(host_id,thread_id) DO NOTHING"
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.execute("DETACH DATABASE source_db")
+
+
+def filter_catalog_rows(path: Path, allowed_ids: set[str]) -> None:
+    """Keep only catalog rows backed by a uniquely identified rollout."""
+    with sqlite3.connect(path, timeout=15) as db:
+        if "local_thread_catalog" not in connection_tables(db):
+            return
+        columns = set(table_columns(db, "main", "local_thread_catalog"))
+        if "thread_id" not in columns:
+            raise RuntimeError(f"unsupported catalog schema in {path}; missing ['thread_id']")
+        db.execute("CREATE TEMP TABLE allowed_thread_ids (id TEXT PRIMARY KEY)")
+        db.executemany(
+            "INSERT INTO allowed_thread_ids(id) VALUES (?)",
+            ((thread_id,) for thread_id in allowed_ids),
+        )
+        db.execute(
+            ("DELETE FROM local_thread_catalog WHERE host_id='local' AND "
+             if "host_id" in columns else "DELETE FROM local_thread_catalog WHERE ")
+            + "thread_id NOT IN "
+            "(SELECT id FROM allowed_thread_ids)"
+        )
+        db.commit()
+
+
+def update_thread_db(path: Path, scan: RolloutScan) -> tuple[int, int]:
     if not path.exists():
         return (0, 0)
     with sqlite3.connect(path, timeout=15) as db:
         db.execute("PRAGMA busy_timeout=15000")
         columns = set(table_columns(db, "main", "threads"))
-        if "model_provider" not in columns:
-            raise RuntimeError(f"threads.model_provider is missing from {path}")
         db.execute("BEGIN IMMEDIATE")
-        provider_changes = db.execute(
-            "UPDATE threads SET model_provider=? WHERE COALESCE(model_provider,'')<>?",
-            (provider, provider),
-        ).rowcount
+        provider_changes = 0
+        if {"id", "model_provider"}.issubset(columns):
+            for thread_id, current_provider in db.execute(
+                "SELECT id,model_provider FROM threads"
+            ).fetchall():
+                rollout = matched_rollout(thread_id, scan)
+                if rollout and current_provider != rollout.provider:
+                    provider_changes += db.execute(
+                        "UPDATE threads SET model_provider=? WHERE id=?",
+                        (rollout.provider, thread_id),
+                    ).rowcount
         visible_changes = 0
         if {"has_user_event", "preview", "first_user_message"}.issubset(columns):
             visible_changes = db.execute(
@@ -575,7 +773,7 @@ def update_thread_db(path: Path, provider: str) -> tuple[int, int]:
     return provider_changes, visible_changes
 
 
-def rebuild_catalog(codex_home: Path, provider: str, state_path: Path | None) -> int:
+def rebuild_catalog(codex_home: Path, state_path: Path | None) -> int:
     catalog_path = codex_home / CATALOG_RELATIVE_PATH
     if not catalog_path.exists() or state_path is None:
         return 0
@@ -592,10 +790,11 @@ def rebuild_catalog(codex_home: Path, provider: str, state_path: Path | None) ->
         user_event = "COALESCE(has_user_event,0)=1" if "has_user_event" in columns else "0"
         thread_source = "NULLIF(thread_source,'')" if "thread_source" in columns else "NULL"
         git_branch = "git_branch" if "git_branch" in columns else "NULL"
+        model_provider = "model_provider" if "model_provider" in columns else "NULL"
         rows = state.execute(
             f"""SELECT id,COALESCE(NULLIF(title,''),NULLIF({preview},''),id),
                        {created}/1000.0,{recency}/1000.0,cwd,source,
-                       {thread_source},{git_branch}
+                       {thread_source},{model_provider},{git_branch}
                 FROM threads
                 WHERE archived=0 AND ({preview}<>'' OR {first_message}<>'' OR {user_event})
                 ORDER BY {recency},id"""
@@ -617,13 +816,23 @@ def rebuild_catalog(codex_home: Path, provider: str, state_path: Path | None) ->
                 f"unsupported local_thread_catalog schema in {catalog_path}; missing {sorted(missing_catalog)}"
             )
         catalog.execute("BEGIN IMMEDIATE")
-        catalog.execute("DELETE FROM local_thread_catalog WHERE host_id='local'")
         catalog.executemany(
             """INSERT INTO local_thread_catalog
                (host_id,thread_id,display_title,source_created_at,source_updated_at,cwd,
                 source_kind,source_detail,model_provider,git_branch,observation_sequence,missing_candidate)
-               VALUES ('local',?,?,?,?,?,?,?,?,?,?,0)""",
-            [(*row[:7], provider, row[7], index) for index, row in enumerate(rows, 1)],
+               VALUES ('local',?,?,?,?,?,?,?,?,?,?,0)
+               ON CONFLICT(host_id,thread_id) DO UPDATE SET
+                 display_title=excluded.display_title,
+                 source_created_at=excluded.source_created_at,
+                 source_updated_at=excluded.source_updated_at,
+                 cwd=excluded.cwd,
+                 source_kind=excluded.source_kind,
+                 source_detail=excluded.source_detail,
+                 model_provider=excluded.model_provider,
+                 git_branch=excluded.git_branch,
+                 observation_sequence=excluded.observation_sequence,
+                 missing_candidate=0""",
+            [(*row, index) for index, row in enumerate(rows, 1)],
         )
         if "local_thread_catalog_sync_state" in tables:
             watermark = max((row[3] for row in rows), default=0)
@@ -712,7 +921,7 @@ def validate_state_files(codex_home: Path) -> None:
 
 def rollback_or_raise(codex_home: Path, backup: Path, original: Exception) -> None:
     try:
-        restore_backup(codex_home, backup)
+        _rollback_snapshot(codex_home, backup)
     except Exception as rollback_error:
         raise RuntimeError(
             f"operation failed: {original}; rollback also failed: {rollback_error}; "
@@ -742,6 +951,13 @@ def run_sync(args: argparse.Namespace) -> None:
         target_provider = args.provider
     elif update_config:
         target_provider = args.provider
+        if target_provider is None:
+            if len(config.configured_providers) != 2:
+                raise RuntimeError(
+                    "automatic switching requires exactly openai and one configured custom provider; "
+                    "specify the target provider explicitly"
+                )
+            target_provider = next(iter(config.configured_providers - {config.provider}))
         if target_provider not in config.configured_providers:
             available = ", ".join(sorted(config.configured_providers))
             raise RuntimeError(
@@ -753,7 +969,6 @@ def run_sync(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"refusing to continue because {len(initial_scan.unreadable)} rollout file(s) are unreadable: {preview}"
         )
-    report_history_normalization(changed_rollouts(initial_scan, target_provider))
     if args.no_quit and codex_home == Path("~/.codex").expanduser().resolve() and is_codex_running():
         raise RuntimeError("refusing to modify the live default CODEX_HOME with --no-quit")
 
@@ -769,11 +984,10 @@ def run_sync(args: argparse.Namespace) -> None:
         scan = scan_rollouts(codex_home)
         if scan.unreadable:
             raise RuntimeError(f"{len(scan.unreadable)} rollout file(s) became unreadable")
-        changes = changed_rollouts(scan, target_provider)
-        source_provider_counts = Counter(item.provider for item in changes)
+        source_provider_counts = Counter(item.provider for item in scan.items)
         backup = create_backup(
             codex_home,
-            (item.path for item in changes),
+            (item.path for item in scan.items),
             operation=args.command,
             source_provider=config.provider,
             target_provider=target_provider,
@@ -782,22 +996,21 @@ def run_sync(args: argparse.Namespace) -> None:
         try:
             if update_config:
                 set_config_provider(config_path, config, target_provider)
-            rollout_updates = [update_rollout(item.path, target_provider) for item in changes]
-            changed_count = sum(update.changed for update in rollout_updates)
             first, second = (codex_home / relative for relative in DB_RELATIVE_PATHS)
-            state_path, inserted_rows, reconciled_rows = merge_thread_dbs(first, second)
-            db_updates = [
-                update_thread_db(path, target_provider)
-                for path in (first, second)
-                if path.exists()
-            ]
-            catalog_rows = rebuild_catalog(codex_home, target_provider, state_path)
+            if update_config:
+                inserted_rows, reconciled_rows = 0, 0
+                db_updates = []
+                catalog_rows = 0
+            else:
+                state_path, inserted_rows, reconciled_rows = merge_thread_dbs(first, second)
+                db_updates = [
+                    update_thread_db(path, scan)
+                    for path in (first, second)
+                    if path.exists()
+                ]
+                catalog_rows = rebuild_catalog(codex_home, state_path)
             validate_state_files(codex_home)
             result = {
-                "changed_count": changed_count,
-                "removed_items": sum(update.removed_items for update in rollout_updates),
-                "converted_items": sum(update.converted_items for update in rollout_updates),
-                "stripped_ids": sum(update.stripped_ids for update in rollout_updates),
                 "inserted_rows": inserted_rows,
                 "reconciled_rows": reconciled_rows,
                 "provider_rows": sum(item[0] for item in db_updates),
@@ -827,12 +1040,9 @@ def run_sync(args: argparse.Namespace) -> None:
     except Exception as prune_error:
         removed_backups = 0
         print(f"Warning: old backups could not be pruned: {prune_error}", file=sys.stderr)
-    print(f"Provider synchronized: {target_provider}")
+    print(f"Provider {'switched' if update_config else 'synchronized'}: {target_provider}")
     print(f"Backup: {backup}")
-    print(f"Rollout files updated: {result['changed_count']}")
-    print(f"Provider-native response items removed: {result['removed_items']}")
-    print(f"Reasoning summaries converted to messages: {result['converted_items']}")
-    print(f"Provider-generated IDs stripped: {result['stripped_ids']}")
+    print("Rollout files updated: 0 (history preserved)")
     print(f"SQLite rows inserted: {result['inserted_rows']}")
     print(f"SQLite rows reconciled: {result['reconciled_rows']}")
     print(f"SQLite provider rows updated: {result['provider_rows']}")
@@ -864,9 +1074,12 @@ def run_restore(args: argparse.Namespace) -> None:
             *manifest.get("absent_rollouts", []),
         ]
     ]
+    if args.no_quit and codex_home == Path("~/.codex").expanduser().resolve() and is_codex_running():
+        raise RuntimeError("refusing to modify the live default CODEX_HOME with --no-quit")
     lifecycle_started = False
     safety_backup: Path | None = None
     operation_error: Exception | None = None
+    restore_result: tuple[int, int, int] | None = None
     try:
         if not args.no_quit:
             lifecycle_started = True
@@ -875,13 +1088,13 @@ def run_restore(args: argparse.Namespace) -> None:
         current = read_config(codex_home / "config.toml")
         safety_backup = create_backup(
             codex_home,
-            selected_rollouts,
+            [*rollout_paths(codex_home), *selected_rollouts],
             operation="pre-restore",
             source_provider=current.provider,
             target_provider=str(manifest.get("source_provider", "unknown")),
         )
         try:
-            restore_backup(codex_home, selected)
+            restore_result = restore_backup(codex_home, selected)
             validate_state_files(codex_home)
         except Exception as error:
             rollback_or_raise(codex_home, safety_backup, error)
@@ -900,8 +1113,12 @@ def run_restore(args: argparse.Namespace) -> None:
                     print(f"Warning: Codex could not be reopened: {reopen_error}", file=sys.stderr)
     if operation_error is not None:
         raise operation_error
-    print(f"Restored backup: {selected}")
+    assert restore_result is not None
+    print(f"Merged backup: {selected}")
     print(f"Safety backup of the pre-restore state: {safety_backup}")
+    print(f"Rollouts recovered: {restore_result[0]}")
+    print(f"Conflicting rollouts left unchanged: {restore_result[1]}")
+    print("Post-backup threads and messages preserved; native lineage compatibility is not guaranteed.")
 
 
 def add_lifecycle_options(parser: argparse.ArgumentParser) -> None:
@@ -917,17 +1134,17 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show provider metadata across all history layers")
     status.add_argument("--json", action="store_true")
     subparsers.add_parser("backups", help="list rollback backups")
-    sync = subparsers.add_parser("sync", help="sync history to the provider already active in config.toml")
+    sync = subparsers.add_parser("sync", help="repair indexes without changing conversation history")
     sync.add_argument("provider", nargs="?", help=argparse.SUPPRESS)
     sync.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
-    sync.add_argument("--keep", type=int, default=5, help="number of rollback backups to retain")
+    sync.add_argument("--keep", type=int, default=None, help="retain N new switch/sync backups (default: keep all)")
     add_lifecycle_options(sync)
-    switch = subparsers.add_parser("switch", help="switch to a provider configured in config.toml and sync history")
-    switch.add_argument("provider")
+    switch = subparsers.add_parser("switch", help="change the default provider; old chats remain untouched")
+    switch.add_argument("provider", nargs="?", help="target provider (default: toggle openai and the sole custom provider)")
     switch.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
-    switch.add_argument("--keep", type=int, default=5, help="number of rollback backups to retain")
+    switch.add_argument("--keep", type=int, default=None, help="retain N new switch/sync backups (default: keep all)")
     add_lifecycle_options(switch)
-    restore = subparsers.add_parser("restore", help="restore a rollback backup (latest by default)")
+    restore = subparsers.add_parser("restore", help="merge a backup without discarding newer work (latest by default)")
     restore.add_argument("backup", nargs="?")
     add_lifecycle_options(restore)
     return parser
@@ -965,7 +1182,7 @@ def main() -> None:
                 f"{manifest.get('source_provider', '?')} -> {manifest.get('target_provider', '?')}"
             )
         return
-    if hasattr(args, "keep") and args.keep < 1:
+    if getattr(args, "keep", None) is not None and args.keep < 1:
         parser.error("--keep must be at least 1")
     lock_path = codex_home / ".codex-switch.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)

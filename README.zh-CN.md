@@ -2,290 +2,121 @@
 
 [English](README.md)
 
-`codex-switch` 是一个面向恢复场景的 macOS 命令行工具。它用于在切换 Codex model provider 后统一本地聊天元数据，并修复“聊天文件仍在磁盘上，但侧栏显示不完整”的问题。
+`codex-switch` 是一个面向 macOS Codex Desktop 的非官方恢复工具。它可以切换默认 provider，但不会重写聊天中的 provider 原生历史记录。Codex 本地存储格式未公开；升级 Codex 后请先在副本上验证，并始终保留备份。
 
 > [!CAUTION]
-> 这是一个非官方 alpha 工具，会操作 Codex 的内部本地状态文件。Codex 可能随版本更新改变这些文件。工具会自动备份、事务写入和校验数据库，但运行前仍应理解下面说明的修改范围。
+> **请停止在真实数据上使用 0.3.2 及更早版本。** 这些版本可能删除 provider 原生 response item、把所有线程重标为同一个 provider，或在恢复时用旧数据库快照覆盖较新的聊天。请保留 `~/.codex/recovery_backups/` 下的全部现有备份，先升级；排查期间不要运行旧版 `sync` 或 `restore`。旧版本已删除的历史无法由本项目凭空重建；只能从最完整、未被改写的备份中恢复。
 
-## 为什么需要它
+## 0.4.0 的重要变化
 
-Codex 的本地聊天历史分布在几层状态中：
+- `switch` 只修改根级 `model_provider`，并完整备份配置、数据库和全部 rollout 文件。它**不会**改写 JSONL response item、reasoning、compaction、工具状态、线程来源信息或侧栏索引。
+- `switch` 不带 provider 参数时，仅在配置中恰好有一个 `openai` 和一个非 OpenAI 的 custom provider 时自动切换；否则必须明确指定目标。
+- `sync` 只做索引协调：按每个 rollout 自己记录的 provider provenance 修复能明确匹配的数据库记录；保留混合 provider 状态以及无法匹配的侧栏条目。
+- `restore` 采用增量合并：补入缺少的 rollout 和数据库记录，同时保留当前及新增数据。若能识别出精确前缀或旧版规范化造成的已知快照差异，可恢复规范原件并接回明确无歧义的新增后缀；冲突不明确时会保留现状并报告，不会强行覆盖。
+- 恢复备份只还原根级默认 provider，不会替换当前整份配置。每次恢复前都会先备份当前完整状态，包括所有 rollout。
+- 默认不清理备份。只有显式指定 `--keep N` 才会清理新版备份，旧版及 recovery 备份不会被删除。
 
-```text
-~/.codex/sessions 和 archived_sessions
-└── 保存对话记录的 JSONL rollout 文件
+history normalizer 仍可作为有意构造请求的宿主代码中的独立库边界；CLI 不会用它改写磁盘上的历史，它也不是自动请求序列化器。
 
-~/.codex/state_5.sqlite
-~/.codex/sqlite/state_5.sqlite
-└── 任务元数据和兼容索引
+## 重要限制
 
-~/.codex/sqlite/codex-dev.db
-└── 桌面端左侧任务目录缓存
-```
+Provider 原生 response ID、加密 reasoning、compaction 状态、工具调用状态和 continuation lineage 可能只适用于生成它们的 provider、账号、endpoint 或 transport。切换 provider 无法让旧聊天自动变成可移植历史，也无法修复 Codex 已拒绝的 lineage。旧聊天请继续使用原 provider；切换后需要新 provider 时，请新建聊天。`sync` 成功不代表旧聊天支持跨 provider 续聊。
 
-切换 provider 后，这几层的 `model_provider` 可能不一致。受影响时，原始对话仍在 rollout 文件中，但主状态库、兼容状态库或侧栏目录仍指向旧 provider，于是看起来像聊天丢失、标题陈旧，或者续聊被分叉成了新任务。
+## 本地存储与 status
 
-`codex-switch` 会把这些层作为一次完整操作进行检查和修复。
+Codex 的本地数据分布在 JSONL rollout、线程数据库（`state_5.sqlite` 和 `sqlite/state_5.sqlite`）及侧栏目录数据库（`sqlite/codex-dev.db`）。`status` 会分别统计这些层：
 
-## 它会做什么
+- `config_provider` 是新请求的默认 provider，不代表每个旧聊天都属于它。
+- `rollouts` 统计文件数，包含活动、归档、空会话和内部会话。
+- `databases` 统计索引中的线程记录；两个数据库位置不等于每个聊天有两份副本。
+- `catalog` 统计侧栏记录，数量不必与 rollout 或线程索引相同。
 
-- 统计 rollout、两套线程数据库和侧栏目录中的 provider 分布。
-- 先规范化 provider 绑定的 response item，再将 rollout 的 `session_meta` 同步到目标 provider。
-- 在两套 `state_5.sqlite` 之间补齐缺失的任务 ID。
-- 对同一任务的冲突元数据选择更新时间更晚的记录。
-- 修复用户事件可见标记并重建本地侧栏目录。
-- 写入前退出 Codex，完成后重新打开。
-- 每次修改前创建 SQLite 一致性备份。
-- 写入或校验失败时自动回滚。
-- 提供备份列表和显式恢复命令。
+各层数量不同本身不代表数据丢失。安全切换后同时看到多个 provider 是正常的；把所有计数改成 `custom` 并不是修复目标。
 
-它**不会**配置 provider 凭据、翻译加密 reasoning 状态，也不会把多个分叉任务合并成一条对话。
-
-## Responses API 历史规范化
-
-`codex-switch` 做的是本地元数据修复，与请求序列化是两个边界。对于将持久化 response item 转成 provider 请求的代码，可以在构造请求前调用可复用的 `codex_provider_sync.history` 模块：
-
-```python
-from codex_provider_sync.history import normalize_response_history
-
-normalized = normalize_response_history(
-    persisted_items,
-    source_provider=session_source_provider,
-    target_provider=active_provider,
-    source_endpoint=session_source_endpoint,
-    source_model=session_source_model,
-    source_auth_mode=session_source_auth_mode,
-    source_transport=session_source_transport,
-    source_continuation_scope=session_continuation_scope,
-    target_endpoint=active_endpoint,
-    target_model=active_model,
-    target_auth_mode=active_auth_mode,
-    target_transport=active_transport,
-    target_continuation_scope=active_continuation_scope,
-    continuation_compatible=same_authenticated_continuation_domain,
-)
-request_input = normalized.items
-```
-
-规范化器会把 provenance 与 API payload 分开保存。continuation 不兼容时保留普通消息内容，删除 provider 生成的 ID，丢弃不透明的 reasoning/compaction 状态（如果有可见 summary，则保留为普通文本），并成对删除 tool-call 状态。它不会把 `item_` 之类的 ID 前缀直接改成 `rs_`。只有请求宿主明确确认来源与目标属于同一个已认证 continuation 域时，才保留原生状态；provider 名称相同或 ID 前缀看起来正确都不够。缺少 provenance 的旧会话会按不兼容保守处理。
-
-`codex-switch` 在迁移 rollout 时也会实际执行这套规范化。其他读取原始持久化 item 的宿主，仍应在构造 Responses API `input` 数组之前调用这个函数。
-
-## 环境要求
-
-- macOS
-- 使用默认 `~/.codex` 本地状态目录的 Codex Desktop
-- Python 3.10 或更高版本
-- 目标 provider 已经写入 `~/.codex/config.toml`
+~~~bash
+codex-switch status
+codex-switch status --json
+~~~
 
 ## 安装
 
-```bash
+需要 macOS、Codex Desktop 和 Python 3.10 或更新版本。自定义 provider 应事先写入 `~/.codex/config.toml`。
+
+~~~bash
 git clone git@github.com:ZPXing-TAA/codex-provider-sync.git
 cd codex-provider-sync
 ./install.sh
-```
-
-安装程序会在 `~/.local/share/codex-provider-sync` 创建隔离虚拟环境，并把一个很小的 shell 启动器安装到 `~/.local/bin/codex-switch`。
-
-确认 `~/.local/bin` 已加入 `PATH`，然后验证：
-
-```bash
 codex-switch --version
-codex-switch status
-```
+~~~
 
-卸载命令但保留恢复备份：
+安装程序会在 `~/.local/share/codex-provider-sync` 创建隔离环境，并将命令安装到 `~/.local/bin`。请确认此目录已加入 `PATH`。卸载命令不会删除恢复备份：
 
-```bash
+~~~bash
 ./uninstall.sh
-```
+~~~
 
-## 快速开始
+升级已有安装：拉取新版并重新运行 `./install.sh`。执行任何修复前，请确认 `codex-switch --version` 显示 0.4.0 或更高版本。
 
-先查看当前状态：
-
-```bash
-codex-switch status
-```
-
-在 Codex 或 CC Switch 中选好目标 provider 后，只需要执行一个命令：
-
-```bash
-codex-switch sync
-```
-
-`sync` 会读取 `~/.codex/config.toml` 根级别当前选中的 `model_provider`，将它作为目标，并只迁移仍指向其他 provider 的 rollout 和数据库记录。无需再填写来源、目标或确认参数。
-
-命令会依次：
-
-1. 自动识别目标 provider，并报告需要规范化的历史数量；
-2. 退出 Codex；
-3. 创建回滚备份；
-4. 同步 rollout、两套数据库和侧栏目录；
-5. 校验结果数据库；
-6. 重新打开 Codex。
-
-如果不使用 CC Switch，也可以用可选的 `switch` 子命令选择已在 `[model_providers.<id>]` 中声明的 provider，并同步：
-
-```bash
-codex-switch switch custom
-```
-
-`switch` 会拒绝尚未配置的 provider，不会创建凭据或猜测 API 地址。
-
-## 命令说明
+## 命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `codex-switch status` | 显示所有历史层的 provider 数量。 |
-| `codex-switch status --json` | 输出机器可读的 JSON。 |
-| `codex-switch sync` | 同步到 `config.toml` 当前选中的 provider。 |
-| `codex-switch switch <provider>` | 切换到已配置 provider 并同步历史。 |
-| `codex-switch backups` | 按时间倒序列出回滚备份。 |
-| `codex-switch restore [path]` | 恢复指定备份；不传路径时恢复最新备份。 |
+| `codex-switch status [--json]` | 查看 provider provenance 与索引数量。 |
+| `codex-switch switch [provider]` | 修改默认 provider；不带参数时仅在恰好一个 OpenAI + 一个 custom provider 时自动切换。 |
+| `codex-switch sync` | 按 rollout 各自记录的来源协调索引，不改写历史。 |
+| `codex-switch backups` | 列出恢复备份。 |
+| `codex-switch restore [path]` | 增量恢复备份；默认选择最新备份并保留当前/新增数据。 |
 
-常用选项：
+选项：
 
-- `--keep N`：保留最新 `N` 份备份，默认 5。
-- `--no-open`：操作结束后不重新打开 Codex。
-- `--codex-home PATH`：操作另一个 Codex home；这是全局选项，应写在子命令前面。
+- `--codex-home PATH` 是全局参数，应放在命令前，可用于操作测试用 Codex home。
+- 写入前通常会退出 Codex；`--no-open` 表示完成后不重新打开。
+- `--keep N` 显式启用新版 `switch`/`sync` 备份清理；旧版及 recovery 备份受保护。
 
-示例：
+先在 Codex 或 CC Switch 中选好目标，然后运行：
 
-```bash
-codex-switch --codex-home /path/to/test-home status --json
-```
+~~~bash
+codex-switch sync
+~~~
 
-## 如何理解 status 数量
+也可以直接选择目标：
 
-示例：
+~~~bash
+codex-switch switch custom
+~~~
 
-```json
-{
-  "config_provider": "openai",
-  "rollouts": {"openai": 214},
-  "response_item_rollouts": {"openai": 203},
-  "response_items": {"openai": 15482},
-  "databases": {
-    "state_5.sqlite": {"openai": 212},
-    "sqlite/state_5.sqlite": {"openai": 164}
-  },
-  "catalog": {"openai": 139}
-}
-```
-
-总数不同不一定代表数据丢失：
-
-- rollout 包含活动、归档、空会话和内部会话；
-- 线程数据库保存交互任务和部分内部任务元数据；
-- 侧栏目录只显示未归档且有用户可见内容的对话。
-
-关键是每层内部的 provider 是否一致。`sync` 还会让两套线程数据库包含相同的已知任务 ID。
+OpenAI 是内置 provider；其他 provider 必须已在 `~/.codex/config.toml` 声明。工具不会创建 provider 凭据。
 
 ## 备份与恢复
 
-备份位于：
+备份保存在 `~/.codex/recovery_backups/<timestamp>-codex-switch/`。新版每次修改前都会完整备份当前配置、所有 rollout 文件及 SQLite 一致性数据库副本。`restore` 会合并缺少的数据，而不是用旧快照替换当前状态。若提示存在不明确冲突，请停止并检查两份数据，不要强行覆盖。
 
-```text
-~/.codex/recovery_backups/<timestamp>-codex-switch/
-```
+如果旧版本已经生成压缩过的 rollout，较早备份中仍可能保留完整原件。请保留所有备份并先对照检查。不要用旧版 `restore`“再试一次”。
 
-每份备份包含：
+先只读列出候选备份：
 
-- 存在时的 `config.toml`；
-- 两套状态库和侧栏数据库的 SQLite 一致性副本；
-- 本次将要修改的 rollout 文件；
-- 记录 rollout 实际来源 provider 数量、目标 provider 和文件路径的 manifest。
-
-查看备份：
-
-```bash
+~~~bash
 codex-switch backups
-```
+~~~
 
-恢复最新备份：
+检查后再指定备份路径；最新备份也可能只是恢复前的安全快照。请先复制 Codex home 到独立目录，在副本上试恢复：
 
-```bash
-codex-switch restore
-```
+~~~bash
+codex-switch --codex-home /path/to/test-home restore /path/to/candidate-backup --no-open
+~~~
 
-恢复指定备份：
-
-```bash
-codex-switch restore ~/.codex/recovery_backups/<timestamp>-codex-switch
-```
-
-恢复前，工具还会先备份当前状态，因此恢复操作本身也可以撤销。
-
-## Provider 绑定历史
-
-response ID、加密 reasoning、compaction 状态和 tool-call continuation 状态，可能只对生成它们的 provider、账号、endpoint、transport 或当前连接有效。切换后原样重放，可能触发 `invalid_id_prefix` 或 `persisted-item lookup ... not supported`。
-
-对于实际发生 provider 变化的 rollout，0.3.1 会：
-
-- 保留普通的 user、assistant、system、developer 消息内容；
-- 删除可移植消息上的 provider 生成 ID；
-- 把可见 reasoning summary 转成普通 assistant 消息；
-- 删除不透明 reasoning、compaction、未知 provider 状态和 tool-call 对；
-- 修改前先把原始内容完整放进回滚备份。
-
-这会牺牲原 provider 的 continuation 效率和历史工具调用轨迹，但保留可移植的对话语义。规范化前始终会把未经修改的原始内容写入回滚备份。
-
-## 会修改哪些文件
-
-根据本机实际存在的文件，同步可能修改：
-
-```text
-~/.codex/config.toml                 # 仅 switch
-~/.codex/sessions/**/*.jsonl         # session_meta + 跨 provider response-item 规范化
-~/.codex/archived_sessions/*.jsonl
-~/.codex/state_5.sqlite
-~/.codex/sqlite/state_5.sqlite
-~/.codex/sqlite/codex-dev.db
-```
-
-安全措施包括：进程锁、配置/rollout 原子替换、SQLite 事务、写前备份，以及写后 `PRAGMA quick_check`。
-
-## 常见问题
-
-### `zsh: killed codex-switch ...`
-
-重新运行 `./install.sh`。安装程序使用 shell 启动器，并将 Python 主程序放在隔离虚拟环境中，从而规避已观察到的 macOS 本地 provenance 执行策略问题。
-
-### `provider 'custom' is not configured`
-
-先在 `~/.codex/config.toml` 中定义 provider。工具不会自动创建 provider 配置或凭据。
-
-### `sync` 会往哪边同步？
-
-它始终以 `~/.codex/config.toml` 根级别当前选中的 `model_provider` 为目标。先在 Codex 或 CC Switch 中选择目的地，再运行 `codex-switch sync`。rollout 中的 provider 只用于判断哪些历史需要迁移，不会按数量猜测目标方向。
-
-### Codex 没有重新打开
-
-数据操作可能已经成功。检查终端输出，然后运行：
-
-```bash
-open -a Codex
-codex-switch status
-```
+检查恢复出的文件、冲突和索引后，再决定是否对真实数据操作。安全备份能保留恢复前状态，但不能让模糊的历史冲突自动变得可合并。
 
 ## 开发
 
-```bash
+~~~bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
 python -m unittest discover -s tests -v
-```
+~~~
 
-测试全部使用临时 Codex home，覆盖 provider 校验、TOML 根配置处理、provider 原生状态自动迁移、双库冲突合并、幂等、自动回滚、App 重开、显式恢复，以及 Responses API 历史的 provider-aware 规范化。
-
-## 项目状态
-
-本项目解决的是实际恢复问题，但依赖未公开的 Codex Desktop 存储结构。升级到新的 Codex 版本后，建议先对 Codex home 副本进行测试。
-
-本项目与 OpenAI 没有关联，也未获得 OpenAI 官方背书。
+测试使用隔离的临时 Codex home。本项目依赖未公开的 Codex Desktop 存储结构，与 OpenAI 无关联，也未获其官方背书。
 
 ## 许可证
 
