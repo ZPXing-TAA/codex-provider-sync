@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.4.0 - Unreleased
+## 0.5.0 - 2026-10-14
+
+- Make `sync` follow the provider already selected in CC Switch. Align built-in OpenAI via `openai_base_url` and configured `custom` / `openai-http` aliases without changing stored chat provider IDs or response items.
+- Clear managed relay routing and stale tokens when returning to the official service. Keep `auth.json` untouched; reject mismatched global keys and unsupported custom authentication before restarting or writing.
+- Recognize both Codex and ChatGPT desktop app names for safe shutdown/reload.
+- Add an isolated native app-server loopback probe covering resumed OpenAI routing, dummy authentication, preserved original messages, and opaque reasoning.
+- Prefer the `openai`/`custom` pair for automatic switching when extra providers such as `openai-http` exist. Treat the existing `openai-http` starting provider as the official side of that pair.
+- Leave the app running and skip backups when the requested provider is already active.
+- Document the CC Switch → `sync` workflow and distinguish route correction from native encryption/lineage compatibility.
+
+## 0.4.0 - 2026-10-14
 
 This is a safety-focused breaking change. **Do not use versions <= 0.3.2 on real Codex data.** They could delete provider-native history, relabel unrelated thread metadata, and overwrite newer state during restore. Preserve all existing recovery backups and upgrade before attempting recovery.
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-provider-sync"
-version = "0.4.0"
-description = "Switch Codex defaults without rewriting history and recover local indexes."
+version = "0.5.0"
+description = "Follow CC Switch provider routes without rewriting Codex history."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -26,6 +26,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
+  "tomlkit>=0.13.2",
   "tomli>=2.0.1; python_version < '3.11'",
 ]
 

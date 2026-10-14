@@ -103,13 +103,47 @@ class CodexSwitchTest(unittest.TestCase):
         self.assertEqual(rollout.read_bytes(), before)
 
     def test_switch_without_provider_rejects_ambiguous_config(self):
-        self.write_config("openai", extra='\n[model_providers.other]\nname = "Other"\n')
+        self.write_config("openai", include_custom=False, extra=(
+            '\n[model_providers.other]\nname = "Other"\n'
+            '\n[model_providers.another]\nname = "Another"\n'
+        ))
         before = (self.home / "config.toml").read_bytes()
 
         result = self.run_cli("switch", "--no-quit", "--no-open")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.home / "config.toml").read_bytes(), before)
+
+    def test_switch_prefers_custom_with_additional_http_provider(self):
+        self.write_config("custom", extra='\n[model_providers.openai-http]\nname = "OpenAI HTTP"\n')
+        rollout = self.write_rollout("openai", encrypted=True)
+        before = rollout.read_bytes()
+        first = self.run_cli("switch", "--no-quit", "--no-open")
+        second = self.run_cli("switch", "--no-quit", "--no-open")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("Provider switched: openai", first.stdout)
+        self.assertIn("Provider switched: custom", second.stdout)
+        self.assertIn("Authentication credentials are unchanged", second.stdout)
+        self.assertEqual(rollout.read_bytes(), before)
+
+    def test_switch_from_official_http_to_custom(self):
+        self.write_config("openai-http", extra='\n[model_providers.openai-http]\nname = "OpenAI HTTP"\n')
+        result = self.run_cli("switch", "--no-quit", "--no-open")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Provider switched: custom", result.stdout)
+
+    def test_switch_to_current_provider_does_not_restart_or_backup(self):
+        self.write_config("custom")
+        rollout = self.write_rollout("openai", encrypted=True)
+        before = rollout.read_bytes()
+        args = MODULE.build_parser().parse_args(["--codex-home", str(self.home), "switch", "custom"])
+        with patch.object(MODULE, "quit_codex") as quit_mock, patch.object(MODULE, "open_codex") as open_mock:
+            MODULE.run_sync(args)
+        quit_mock.assert_not_called()
+        open_mock.assert_not_called()
+        self.assertEqual(MODULE.backup_paths(self.home), [])
+        self.assertEqual(rollout.read_bytes(), before)
 
     def test_sync_rejects_target_different_from_config(self):
         self.write_config("custom")
@@ -122,6 +156,103 @@ class CodexSwitchTest(unittest.TestCase):
         self.assertIn("sync cannot target", result.stderr)
         self.assertEqual(rollout.read_bytes(), before)
         self.assertIn('model_provider = "custom"', (self.home / "config.toml").read_text())
+
+    def test_sync_follows_cc_switch_route_without_relabeling_history_or_auth(self):
+        self.write_config("custom", extra=(
+            'base_url = "https://relay.example/v1"\nrequires_openai_auth = true\n'
+            'experimental_bearer_token = "dummy-relay-key"\nsupports_websockets = false\n'
+            '\n[model_providers.openai-http]\nname = "OpenAI HTTP"\nrequires_openai_auth = true\n'
+            '\n[projects."/keep/me"]\ntrust_level = "trusted" # keep comment\n'
+        ))
+        auth = self.home / "auth.json"
+        auth.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "dummy-relay-key"}))
+        original_auth = auth.read_bytes()
+        rollout = self.write_rollout("openai", encrypted=True)
+        original_history = rollout.read_bytes()
+        self.create_state(self.home / "state_5.sqlite", "t1", "openai")
+
+        result = self.run_cli("sync", "--no-quit", "--no-open")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = MODULE.tomllib.loads((self.home / "config.toml").read_text())
+        self.assertEqual(parsed["model_provider"], "custom")
+        self.assertEqual(parsed["openai_base_url"], "https://relay.example/v1")
+        self.assertEqual(parsed["model_providers"]["openai-http"], parsed["model_providers"]["custom"])
+        self.assertIn("keep comment", (self.home / "config.toml").read_text())
+        self.assertEqual(auth.read_bytes(), original_auth)
+        self.assertEqual(rollout.read_bytes(), original_history)
+        with sqlite3.connect(self.home / "state_5.sqlite") as db:
+            self.assertEqual(db.execute("SELECT model_provider FROM threads WHERE id='t1'").fetchone()[0], "openai")
+        before_repeat = (self.home / "config.toml").read_bytes()
+        repeated = self.run_cli("sync", "--no-quit", "--no-open")
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual((self.home / "config.toml").read_bytes(), before_repeat)
+
+    def test_sync_official_selection_clears_stale_relay_routes_and_tokens(self):
+        (self.home / "config.toml").write_text(
+            'model_provider = "openai-http"\n'
+            f'openai_base_url = "https://relay.example/v1" # {MODULE.ROUTE_COMMENT}\n'
+            '[model_providers.custom]\nname = "Relay"\nbase_url = "https://relay.example/v1"\n'
+            'experimental_bearer_token = "stale-dummy-key"\nrequires_openai_auth = true\n'
+            '[model_providers.openai-http]\nname = "OpenAI HTTP"\nrequires_openai_auth = true\nsupports_websockets = false\n'
+        )
+        rollout = self.write_rollout("custom", encrypted=True)
+        original_history = rollout.read_bytes()
+        result = self.run_cli("sync", "--no-quit", "--no-open")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = MODULE.tomllib.loads((self.home / "config.toml").read_text())
+        self.assertEqual(parsed["model_provider"], "openai-http")
+        self.assertNotIn("openai_base_url", parsed)
+        self.assertEqual(parsed["model_providers"]["custom"], parsed["model_providers"]["openai-http"])
+        self.assertNotIn("experimental_bearer_token", parsed["model_providers"]["custom"])
+        self.assertEqual(rollout.read_bytes(), original_history)
+
+    def test_sync_builtin_official_selection_clears_managed_relay_url(self):
+        self.write_config("openai")
+        state = MODULE.read_config(self.home / "config.toml")
+        state = MODULE.ConfigState(state.provider, state.configured_providers,
+            f'openai_base_url = "https://relay.example/v1" # {MODULE.ROUTE_COMMENT}\n' + state.text)
+        content, _ = MODULE.render_active_route(state, self.home)
+        parsed = MODULE.tomllib.loads(content.decode())
+        self.assertNotIn("openai_base_url", parsed)
+        self.assertTrue(parsed["model_providers"]["custom"]["requires_openai_auth"])
+
+    def test_sync_adds_missing_history_alias_after_cc_switch_replaces_config(self):
+        self.write_config("openai", include_custom=False)
+        with (self.home / "config.toml").open("a") as config:
+            config.write('openai_base_url = "https://stale-relay.example/v1"\n')
+        rollout = self.write_rollout("custom", encrypted=True)
+        original = rollout.read_bytes()
+        result = self.run_cli("sync", "--no-quit", "--no-open")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = MODULE.tomllib.loads((self.home / "config.toml").read_text())
+        self.assertNotIn("openai_base_url", parsed)
+        self.assertTrue(parsed["model_providers"]["custom"]["requires_openai_auth"])
+        self.assertEqual(rollout.read_bytes(), original)
+
+    def test_sync_rejects_relay_without_matching_global_credentials_before_backup(self):
+        self.write_config("custom", extra='base_url = "https://relay.example/v1"\nexperimental_bearer_token = "relay-key"\n')
+        (self.home / "auth.json").write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "another-key"}))
+        before = (self.home / "config.toml").read_bytes()
+        args = MODULE.build_parser().parse_args(["--codex-home", str(self.home), "sync"])
+        with patch.object(MODULE, "quit_codex") as quit_mock:
+            with self.assertRaisesRegex(RuntimeError, "API key differ"):
+                MODULE.run_sync(args)
+        quit_mock.assert_not_called()
+        self.assertEqual((self.home / "config.toml").read_bytes(), before)
+        self.assertEqual(MODULE.backup_paths(self.home), [])
+
+    def test_lifecycle_recognizes_chatgpt_app_and_opens_installed_name(self):
+        with patch.object(MODULE.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0)]):
+            self.assertTrue(MODULE.is_codex_running())
+        with patch.object(MODULE.Path, "is_dir", return_value=False):
+            with patch.object(MODULE.subprocess, "run") as run:
+                MODULE.open_codex()
+                run.assert_called_once_with(["open", "-a", "Codex"], check=True)
+        with patch.object(MODULE.Path, "is_dir", side_effect=[False, False, True]):
+            with patch.object(MODULE.subprocess, "run") as run:
+                MODULE.open_codex()
+                run.assert_called_once_with(["open", "-a", "ChatGPT"], check=True)
 
     def test_switch_rejects_unconfigured_provider(self):
         self.write_config("openai", include_custom=False)
@@ -156,16 +287,16 @@ class CodexSwitchTest(unittest.TestCase):
         self.assertEqual(data["configured_providers"], ["openai"])
 
     def test_switch_handles_config_without_trailing_newline(self):
-        (self.home / "config.toml").write_text('model = "keep-me"')
+        (self.home / "config.toml").write_text('model = "keep-me"\n[model_providers.custom]\nname = "Custom"')
         self.write_rollout("openai")
 
-        result = self.run_cli("switch", "openai", "--no-quit", "--no-open")
+        result = self.run_cli("switch", "custom", "--no-quit", "--no-open")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         status = self.run_cli("status", "--json")
         self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertEqual(json.loads(status.stdout)["config_provider"], "openai")
-        self.assertIn('model = "keep-me"\nmodel_provider = "openai"', (self.home / "config.toml").read_text())
+        self.assertEqual(json.loads(status.stdout)["config_provider"], "custom")
+        self.assertIn('model = "keep-me"\nmodel_provider = "custom"', (self.home / "config.toml").read_text())
 
     def test_switch_preserves_provider_native_history_byte_for_byte(self):
         self.write_config("custom")
@@ -679,7 +810,7 @@ class CodexSwitchTest(unittest.TestCase):
         self.write_config("custom")
         self.write_rollout("custom", encrypted=True)
         for _ in range(6):
-            switched = self.run_cli("switch", "openai", "--no-quit", "--no-open")
+            switched = self.run_cli("switch", "--no-quit", "--no-open")
             self.assertEqual(switched.returncode, 0, switched.stderr)
         self.assertEqual(len(MODULE.backup_paths(self.home)), 6)
 

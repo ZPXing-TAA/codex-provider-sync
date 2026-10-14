@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass
 import datetime as dt
 import fcntl
@@ -17,6 +18,8 @@ import subprocess
 import sys
 import time
 from typing import Iterable, Mapping
+
+import tomlkit
 
 from . import __version__
 
@@ -36,6 +39,8 @@ ENCRYPTED_TOKEN = b'"encrypted_content"'
 PROVIDER_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
 ROOT_PROVIDER_LINE = re.compile(r"^(?P<indent>\s*)model_provider\s*=.*$")
 TABLE_HEADER_LINE = re.compile(r"^\s*\[\[?.+?\]\]?\s*(?:#.*)?$")
+ROUTE_PROVIDERS = frozenset({"openai", "custom", "openai-http"})
+ROUTE_COMMENT = "codex-switch: follows the provider selected in CC Switch"
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,54 @@ def render_config_with_provider(config_path: Path, state: ConfigState, provider:
 def set_config_provider(config_path: Path, state: ConfigState, provider: str) -> None:
     content = render_config_with_provider(config_path, state, provider)
     atomic_write(config_path, content, config_path.stat().st_mode & 0o7777)
+
+
+def render_active_route(
+    config: ConfigState, codex_home: Path, history_providers: Iterable[str] = ()
+) -> tuple[bytes, tuple[str, ...]]:
+    """Align known provider routes without relabeling or rewriting stored history."""
+    if config.provider not in ROUTE_PROVIDERS:
+        return config.text.encode("utf-8"), ()
+    document = tomlkit.parse(config.text)
+    providers = document.get("model_providers", {})
+    if config.provider == DEFAULT_PROVIDER:
+        selected = tomlkit.table()
+        selected.update({"name": "OpenAI", "wire_api": "responses", "requires_openai_auth": True})
+    else:
+        selected = deepcopy(providers[config.provider])
+    if selected.get("wire_api", "responses") != "responses":
+        raise RuntimeError("sync routing requires a Responses API provider; indexes were not changed")
+    url = selected.get("base_url")
+    if url:
+        # The built-in OpenAI provider uses global auth, not a custom provider's
+        # token command, env_key, or extra headers. Do not silently mix credentials.
+        if any(selected.get(key) for key in ("env_key", "auth", "http_headers", "env_http_headers", "query_params")):
+            raise RuntimeError("sync cannot mirror this provider's custom authentication/headers into built-in openai")
+        auth_path = codex_home / "auth.json"
+        if not auth_path.is_file():
+            raise RuntimeError("auth.json is missing; select the provider in CC Switch before running sync")
+        auth = json.loads(auth_path.read_text(encoding="utf-8"))
+        key = auth.get("OPENAI_API_KEY")
+        token = selected.get("experimental_bearer_token")
+        if auth.get("auth_mode") not in {None, "apikey"} or not isinstance(key, str) or not key:
+            raise RuntimeError("the selected API endpoint requires CC Switch's API-key login in auth.json")
+        if token and token != key:
+            raise RuntimeError("provider token and auth.json API key differ; reselect the provider in CC Switch")
+        document["openai_base_url"] = str(url)
+        document["openai_base_url"].comment(ROUTE_COMMENT)
+    elif "openai_base_url" in document:
+        del document["openai_base_url"]
+    aliases = []
+    needed_providers = config.configured_providers | set(history_providers)
+    for provider in sorted(ROUTE_PROVIDERS - {DEFAULT_PROVIDER, config.provider}):
+        if provider not in needed_providers:
+            continue
+        if "model_providers" not in document:
+            document["model_providers"] = tomlkit.table()
+        document["model_providers"][provider] = deepcopy(selected)
+        aliases.append(provider)
+    rendered = tomlkit.dumps(document).encode("utf-8")
+    return rendered, tuple([DEFAULT_PROVIDER, *aliases])
 
 
 def sqlite_tables(path: Path) -> set[str]:
@@ -887,18 +940,25 @@ def provider_counts(codex_home: Path) -> dict:
 
 
 def is_codex_running() -> bool:
-    return subprocess.run(
-        ["pgrep", "-x", "Codex"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    ).returncode == 0
+    return any(
+        subprocess.run(
+            ["pgrep", "-x", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0
+        for name in ("Codex", "ChatGPT")
+    )
 
 
 def quit_codex() -> None:
-    subprocess.run(
-        ["osascript", "-e", 'quit app "Codex"'],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    for name in ("Codex", "ChatGPT"):
+        if subprocess.run(
+            ["pgrep", "-x", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0:
+            subprocess.run(
+                ["osascript", "-e", f'quit app "{name}"'],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     deadline = time.time() + 20
     while time.time() < deadline:
         if not is_codex_running():
@@ -908,7 +968,11 @@ def quit_codex() -> None:
 
 
 def open_codex() -> None:
-    subprocess.run(["open", "-a", "Codex"], check=True)
+    name = next((
+        name for name in ("Codex", "ChatGPT")
+        if any((root / f"{name}.app").is_dir() for root in (Path("/Applications"), Path.home() / "Applications"))
+    ), "Codex")
+    subprocess.run(["open", "-a", name], check=True)
 
 
 def validate_state_files(codex_home: Path) -> None:
@@ -952,23 +1016,37 @@ def run_sync(args: argparse.Namespace) -> None:
     elif update_config:
         target_provider = args.provider
         if target_provider is None:
-            if len(config.configured_providers) != 2:
+            if "custom" in config.configured_providers and config.provider in {
+                DEFAULT_PROVIDER, "custom", "openai-http"
+            }:
+                target_provider = DEFAULT_PROVIDER if config.provider == "custom" else "custom"
+            elif len(config.configured_providers) == 2:
+                target_provider = next(iter(config.configured_providers - {config.provider}))
+            else:
+                available = ", ".join(sorted(config.configured_providers))
                 raise RuntimeError(
-                    "automatic switching requires exactly openai and one configured custom provider; "
-                    "specify the target provider explicitly"
+                    f"cannot choose an automatic switch from {config.provider!r}; "
+                    f"configured providers: {available}. "
+                    "Use `codex-switch switch <provider>` to choose the target."
                 )
-            target_provider = next(iter(config.configured_providers - {config.provider}))
         if target_provider not in config.configured_providers:
             available = ", ".join(sorted(config.configured_providers))
             raise RuntimeError(
                 f"provider {target_provider!r} is not configured in config.toml; available: {available}"
             )
+        if target_provider == config.provider:
+            print(f"Default provider is already {target_provider}; no changes made.")
+            print("Existing chats keep their provider; authentication credentials are unchanged.")
+            return
     initial_scan = scan_rollouts(codex_home)
     if initial_scan.unreadable:
         preview = "; ".join(f"{path}: {error}" for path, error in initial_scan.unreadable[:3])
         raise RuntimeError(
             f"refusing to continue because {len(initial_scan.unreadable)} rollout file(s) are unreadable: {preview}"
         )
+    route_content, route_aliases = (config.text.encode("utf-8"), ()) if update_config else render_active_route(
+        config, codex_home, (item.provider for item in initial_scan.items)
+    )
     if args.no_quit and codex_home == Path("~/.codex").expanduser().resolve() and is_codex_running():
         raise RuntimeError("refusing to modify the live default CODEX_HOME with --no-quit")
 
@@ -996,6 +1074,8 @@ def run_sync(args: argparse.Namespace) -> None:
         try:
             if update_config:
                 set_config_provider(config_path, config, target_provider)
+            elif route_content != config.text.encode("utf-8"):
+                atomic_write(config_path, route_content, config_path.stat().st_mode & 0o7777)
             first, second = (codex_home / relative for relative in DB_RELATIVE_PATHS)
             if update_config:
                 inserted_rows, reconciled_rows = 0, 0
@@ -1041,6 +1121,13 @@ def run_sync(args: argparse.Namespace) -> None:
         removed_backups = 0
         print(f"Warning: old backups could not be pruned: {prune_error}", file=sys.stderr)
     print(f"Provider {'switched' if update_config else 'synchronized'}: {target_provider}")
+    if update_config:
+        print("Default provider changed for new chats; existing chats keep their provider.")
+        print("Authentication credentials are unchanged; use matching credentials for each provider.")
+    else:
+        if route_aliases:
+            print(f"Existing provider routes aligned with the selected provider: {', '.join(route_aliases)}")
+        print("CC Switch credentials unchanged; native encrypted/lineage compatibility is not guaranteed.")
     print(f"Backup: {backup}")
     print("Rollout files updated: 0 (history preserved)")
     print(f"SQLite rows inserted: {result['inserted_rows']}")
@@ -1134,13 +1221,13 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show provider metadata across all history layers")
     status.add_argument("--json", action="store_true")
     subparsers.add_parser("backups", help="list rollback backups")
-    sync = subparsers.add_parser("sync", help="repair indexes without changing conversation history")
+    sync = subparsers.add_parser("sync", help="follow the active CC Switch route and repair indexes without rewriting history")
     sync.add_argument("provider", nargs="?", help=argparse.SUPPRESS)
     sync.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     sync.add_argument("--keep", type=int, default=None, help="retain N new switch/sync backups (default: keep all)")
     add_lifecycle_options(sync)
     switch = subparsers.add_parser("switch", help="change the default provider; old chats remain untouched")
-    switch.add_argument("provider", nargs="?", help="target provider (default: toggle openai and the sole custom provider)")
+    switch.add_argument("provider", nargs="?", help="target provider (default: toggle openai/custom, otherwise the sole custom provider)")
     switch.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     switch.add_argument("--keep", type=int, default=None, help="retain N new switch/sync backups (default: keep all)")
     add_lifecycle_options(switch)

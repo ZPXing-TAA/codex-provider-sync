@@ -2,16 +2,27 @@
 
 [English](README.md)
 
-`codex-switch` 是一个面向 macOS Codex Desktop 的非官方恢复工具。它可以切换默认 provider，但不会重写聊天中的 provider 原生历史记录。Codex 本地存储格式未公开；升级 Codex 后请先在副本上验证，并始终保留备份。
+`codex-switch` 是一个面向 macOS Codex Desktop / ChatGPT 中 Codex 的非官方工具。**先在 CC Switch 切换服务，再运行 `codex-switch sync`。** 工具协调旧聊天的请求路由和本地索引，不压缩、不删除、不重写原生聊天历史。
+
+两边使用同一个命令，不需要指定 `openai` / `custom`，也不需要 `--yes`。命令会关闭并重新打开桌面应用；请先等其他任务完成。
 
 > [!CAUTION]
 > **请停止在真实数据上使用 0.3.2 及更早版本。** 这些版本可能删除 provider 原生 response item、把所有线程重标为同一个 provider，或在恢复时用旧数据库快照覆盖较新的聊天。请保留 `~/.codex/recovery_backups/` 下的全部现有备份，先升级；排查期间不要运行旧版 `sync` 或 `restore`。旧版本已删除的历史无法由本项目凭空重建；只能从最完整、未被改写的备份中恢复。
 
-## 0.4.0 的重要变化
+## 0.5 的重要变化
+
+- `sync` 跟随 CC Switch 已选好的配置，不会再切一次 provider，也不修改 `auth.json`。支持 `openai`、`custom`、`openai-http` 这组 provider。
+- 内置 `openai` 在此工作流中表示官方服务；选中它时会清除 `openai_base_url`。中转站请使用带明确 `base_url` 的 `custom` 配置。若 CC Switch 删除了旧聊天仍需使用的 `custom` / `openai-http` 定义，工具会补回指向当前服务的别名。
+- 当选中中转站时，使用官方支持的 `openai_base_url` 把旧 OpenAI 聊天的请求发往当前中转地址；其他已配置的 `custom` / `openai-http` 路由也跟随当前服务。切回官方时清理工具留下的中转地址，并替换旧路由中残留的中转 token。不会把旧聊天重标成新 provider。
+- 因此 `sync` 会更新配置里的上述路由定义，覆盖非当前侧的配置别名。服务地址和登录由 CC Switch 管理；下次切换仍先用 CC Switch。完整修改前配置会保存在备份中。
+- 自定义 endpoint 必须配有 CC Switch 写入 `auth.json` 的匹配 API key。使用独立 `env_key`、认证命令或额外请求头的复杂配置不能自动映射到内置 OpenAI provider，工具会在修改前报错。
+- 同时识别旧 `Codex.app` 和新版 `ChatGPT.app`，确保重启后重新加载配置。
+
+0.4 引入的数据保护机制继续保留：
 
 - `switch` 只修改根级 `model_provider`，并完整备份配置、数据库和全部 rollout 文件。它**不会**改写 JSONL response item、reasoning、compaction、工具状态、线程来源信息或侧栏索引。
-- `switch` 不带 provider 参数时，仅在配置中恰好有一个 `openai` 和一个非 OpenAI 的 custom provider 时自动切换；否则必须明确指定目标。
-- `sync` 只做索引协调：按每个 rollout 自己记录的 provider provenance 修复能明确匹配的数据库记录；保留混合 provider 状态以及无法匹配的侧栏条目。
+- `switch` 不带 provider 参数时，会在 `openai` 和 `custom` 之间切换，额外的 `openai-http` 等配置不会阻止切换。从 `openai-http` 执行时切到 `custom`。没有名为 `custom` 的 provider 时，仅在恰好配置一个非 OpenAI provider 的情况下自动切换；其余情况须明确指定目标。
+- `sync` 的索引协调仍按每个 rollout 自己记录的 provider provenance 修复能明确匹配的数据库记录；保留混合 provider 状态以及无法匹配的侧栏条目。
 - `restore` 采用增量合并：补入缺少的 rollout 和数据库记录，同时保留当前及新增数据。若能识别出精确前缀或旧版规范化造成的已知快照差异，可恢复规范原件并接回明确无歧义的新增后缀；冲突不明确时会保留现状并报告，不会强行覆盖。
 - 恢复备份只还原根级默认 provider，不会替换当前整份配置。每次恢复前都会先备份当前完整状态，包括所有 rollout。
 - 默认不清理备份。只有显式指定 `--keep N` 才会清理新版备份，旧版及 recovery 备份不会被删除。
@@ -20,7 +31,9 @@ history normalizer 仍可作为有意构造请求的宿主代码中的独立库�
 
 ## 重要限制
 
-Provider 原生 response ID、加密 reasoning、compaction 状态、工具调用状态和 continuation lineage 可能只适用于生成它们的 provider、账号、endpoint 或 transport。切换 provider 无法让旧聊天自动变成可移植历史，也无法修复 Codex 已拒绝的 lineage。旧聊天请继续使用原 provider；切换后需要新 provider 时，请新建聊天。`sync` 成功不代表旧聊天支持跨 provider 续聊。
+这次修复解决的是“中转 key 被发给官方接口”的路由错配，不保证任意服务间的原生状态兼容。Provider 原生 response ID、加密 reasoning、compaction 和 continuation lineage 可能依赖原来的账号、endpoint 或 transport；工具会保留这些内容，而不会删除它们来强行续聊。
+
+旧 `openai` 聊天仍使用内置 provider 的传输能力，包括 WebSocket；仅支持 HTTP 的中转站可能仍无法继续这些聊天。如果发送出现 encrypted content / lineage 错误，请保留原件和备份，并切回原服务，不要运行旧版压缩或恢复命令。`sync` 成功表示配置与索引处理完成，不表示已在真实服务上验证续聊。
 
 ## 本地存储与 status
 
@@ -55,15 +68,15 @@ codex-switch --version
 ./uninstall.sh
 ~~~
 
-升级已有安装：拉取新版并重新运行 `./install.sh`。执行任何修复前，请确认 `codex-switch --version` 显示 0.4.0 或更高版本。
+升级已有安装：拉取新版并重新运行 `./install.sh`。使用 CC Switch 路由跟随功能前，请确认 `codex-switch --version` 显示 0.5.0 或更高版本。
 
 ## 命令
 
 | 命令 | 作用 |
 | --- | --- |
 | `codex-switch status [--json]` | 查看 provider provenance 与索引数量。 |
-| `codex-switch switch [provider]` | 修改默认 provider；不带参数时仅在恰好一个 OpenAI + 一个 custom provider 时自动切换。 |
-| `codex-switch sync` | 按 rollout 各自记录的来源协调索引，不改写历史。 |
+| `codex-switch switch [provider]` | 不带参数时在 `openai`/`custom` 之间切换；也可明确指定目标。 |
+| `codex-switch sync` | 跟随 CC Switch 当前路由，协调索引，不改写历史。 |
 | `codex-switch backups` | 列出恢复备份。 |
 | `codex-switch restore [path]` | 增量恢复备份；默认选择最新备份并保留当前/新增数据。 |
 
@@ -79,13 +92,11 @@ codex-switch --version
 codex-switch sync
 ~~~
 
-也可以直接选择目标：
-
-~~~bash
-codex-switch switch custom
-~~~
-
 OpenAI 是内置 provider；其他 provider 必须已在 `~/.codex/config.toml` 声明。工具不会创建 provider 凭据。
+
+**使用 CC Switch 时不要随后运行 `switch`。** 那会再次修改默认 provider，且不会切换认证。`switch [provider]` 只保留给手动管理配置的用户；它不是 CC Switch 的登录切换替代品。选择当前 provider 时不会重启应用或再备份。
+
+如果仍出现 `401 / invalid_api_key`，核对错误里的请求地址是否是 CC Switch 当前选中的服务。地址正确但 key 被拒绝时，需要检查该服务的 key / 登录状态；本工具不会生成或替换凭据。
 
 ## 备份与恢复
 
@@ -117,6 +128,12 @@ python -m unittest discover -s tests -v
 ~~~
 
 测试使用隔离的临时 Codex home。本项目依赖未公开的 Codex Desktop 存储结构，与 OpenAI 无关联，也未获其官方背书。
+
+可选的原生路由验证（需要 Node.js 和本机 Codex CLI）仅使用临时数据、测试 key 和本地回环服务，不调用真实模型：
+
+~~~bash
+CODEX_BINARY=/path/to/codex node tests/route_probe.mjs
+~~~
 
 ## 许可证
 
